@@ -27,3 +27,18 @@ export async function uploadFiles(files: File[]): Promise<UploadResponse> {
   if (!res.ok) throw new Error(`שגיאת שרת (${res.status})`);
   return (await res.json()) as UploadResponse;
 }
+
+export async function extractPage(fileId: string, pageNumber: number): Promise<string> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/extract/${fileId}/${pageNumber}`, { method: "POST" });
+  } catch {
+    throw new Error("לא ניתן להתחבר לשרת");
+  }
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { detail?: unknown } | null;
+    const detail = typeof body?.detail === "string" ? body.detail : null;
+    throw new Error(detail ? `החילוץ נכשל: ${detail}` : `שגיאת שרת (${res.status})`);
+  }
+  return ((await res.json()) as { text: string }).text;
+}
