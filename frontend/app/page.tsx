@@ -25,6 +25,7 @@ export default function Home() {
   const [dragging, setDragging] = useState(false);
   const [selected, setSelected] = useState<PageInfo | null>(null);
   const [extractions, setExtractions] = useState<Record<string, Extraction>>({});
+  const [extractAllProgress, setExtractAllProgress] = useState<{ done: number; total: number } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleExtract = useCallback(async (page: PageInfo) => {
@@ -38,6 +39,17 @@ export default function Home() {
       setExtractions((prev) => ({ ...prev, [key]: { status: "error", message } }));
     }
   }, []);
+
+  const handleExtractAll = useCallback(async () => {
+    // One page at a time, not Promise.all: the backend already retries/rotates API keys on rate
+    // limits, but firing every page at once would still exhaust all keys' quota in one burst.
+    setExtractAllProgress({ done: 0, total: pages.length });
+    for (const [i, p] of pages.entries()) {
+      await handleExtract(p);
+      setExtractAllProgress({ done: i + 1, total: pages.length });
+    }
+    setExtractAllProgress(null);
+  }, [pages, handleExtract]);
 
   const handleFiles = useCallback(async (list: FileList | File[]) => {
     const files = Array.from(list);
@@ -103,7 +115,18 @@ export default function Home() {
 
       {pages.length > 0 && (
         <>
-          <h2>{pages.length} עמודים</h2>
+          <div className="pages-bar">
+            <h2>{pages.length} עמודים</h2>
+            <button
+              className="extract-all-btn"
+              disabled={extractAllProgress !== null}
+              onClick={() => void handleExtractAll()}
+            >
+              {extractAllProgress
+                ? `מחלץ ${extractAllProgress.done}/${extractAllProgress.total}...`
+                : "חלץ את כל העמודים"}
+            </button>
+          </div>
           <div className="grid">
             {pages.map((p) => {
               const extraction = extractions[pageKey(p)];
