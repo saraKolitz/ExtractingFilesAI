@@ -8,10 +8,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .services.ai_service import ERROR_PREFIX, extract_data_from_image
+# from .services.ai_service import ERROR_PREFIX, extract_data_from_image
+from .services.ai_service import extract_fields_with_gemini
+from .services.image_processing import extract_field_images
+from .services.ocr_service import get_word_coordinates
 from .services.processor import UPLOADS_DIR, PageInfo, _process
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # A file id is uuid4().hex (see processor._process). It becomes part of a file path, so it must
 # be exactly that and nothing else.
@@ -56,21 +59,23 @@ async def upload(request: Request, request_files: list[UploadFile] = File(..., a
     return UploadResponse(pages=pages, errors=errors)
 
 
-class ExtractResponse(BaseModel):
-    text: str
+def _extract_fields(image_bytes: bytes) -> dict:
+    words_data = get_word_coordinates(image_bytes)
+    cropped_images = extract_field_images(image_bytes, words_data)
+    return extract_fields_with_gemini(cropped_images)
 
 
-@app.post("/extract/{file_id}/{page_number}", response_model=ExtractResponse)
+@app.post("/extract/{file_id}/{page_number}")
 async def extract(file_id: str, page_number: int):
     if not FILE_ID_RE.fullmatch(file_id):
         raise HTTPException(status_code=400, detail="invalid file id")
     image_path = UPLOADS_DIR / file_id / "pages" / f"page_{page_number}.png"
     if not image_path.is_file():
         raise HTTPException(status_code=404, detail="page not found")
-    text = await run_in_threadpool(extract_data_from_image, str(image_path))
-    if text.startswith(ERROR_PREFIX):
-        raise HTTPException(status_code=502, detail=text[len(ERROR_PREFIX):][:MAX_ERROR_DETAIL])
-    return ExtractResponse(text=text)
+    image_bytes = image_path.read_bytes()
+    # Vision, OpenCV and Gemini calls all block, so the whole sequence runs off the event loop.
+    final_results = await run_in_threadpool(_extract_fields, image_bytes)
+    return final_results
 
 
 @app.get("/health")

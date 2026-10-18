@@ -4,6 +4,7 @@
 uploads/
 *credentials*.json
 service-account*.json
+ocr-vision-project.json
 .venv/
 __pycache__/
 *.pyc
@@ -11,3 +12,5 @@ node_modules/
 .next/
 out/
 *.log
+backend/.env
+backend/ocr-vision-project.json

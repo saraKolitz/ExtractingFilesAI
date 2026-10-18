@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import os
@@ -7,9 +8,9 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parents[3]
+BACKEND_DIR = Path(__file__).resolve().parents[2]
 # The API is configured at import time, before main.py's load_dotenv() call can run.
-load_dotenv(ROOT / ".env")
+load_dotenv(BACKEND_DIR / ".env")
 
 # Logs must never contain personal data (file names, content) - only error types.
 logger = logging.getLogger("uvicorn.error")
@@ -100,7 +101,7 @@ PROMPT = PROMPT.replace("<<ENTITY_LIST>>", ", ".join(ENTITY_TEMPLATES.keys()))
 
 # REST and not the default gRPC: when the connection fails (e.g. a TLS error) gRPC retries for
 # minutes, so the except below would never get to return the error.
-genai.configure(api_key=os.getenv("API_KEY") or None, transport="rest")
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY") or None, transport="rest")
 
 
 def classify_entity(model, image) -> str | None:
@@ -140,3 +141,26 @@ def extract_data_from_image(image_path: str) -> str:
     except Exception as exc:
         logger.error("image extraction failed: %s", type(exc).__name__)
         return f"{ERROR_PREFIX}{exc}"
+
+
+FIELD_PROMPT = (
+    "This is a cropped image of the field '{field_name}' from a Hebrew form. It may be handwritten, "
+    "printed, or empty. Read the text. If it is empty or illegible, return 'null'. Return ONLY the "
+    "extracted value without any markdown, explanations, or extra text."
+)
+
+
+def extract_fields_with_gemini(cropped_images: dict[str, bytes]) -> dict:
+    """Read each cropped field image with Gemini. Returns {field_name: text, or None if empty}.
+
+    API errors are raised, not swallowed: a failed call must not look like an empty field.
+    """
+    model = genai.GenerativeModel(os.getenv("MODEL_NAME") or DEFAULT_MODEL)
+    results: dict[str, str | None] = {}
+    for field_name, image_bytes in cropped_images.items():
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            response = model.generate_content([FIELD_PROMPT.format(field_name=field_name), image])
+        text = response.text.strip().strip("'\"`").strip()
+        # A missing field stays empty - never a guessed value or the literal word "null".
+        results[field_name] = None if not text or text.lower() == "null" else text
+    return results
