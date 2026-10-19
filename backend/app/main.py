@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -9,9 +10,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # from .services.ai_service import ERROR_PREFIX, extract_data_from_image
-from .services.ai_service import extract_fields_with_gemini
-from .services.image_processing import extract_field_images
-from .services.ocr_service import get_word_coordinates
+# from .services.ai_service import extract_fields_with_gemini
+# from .services.ai_service import extract_full_image_with_claude
+from .services.ai_service import extract_with_agent_loop
+# from .services.image_processing import extract_field_images
+# from .services.ocr_service import get_word_coordinates
 from .services.processor import UPLOADS_DIR, PageInfo, _process
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -59,10 +62,10 @@ async def upload(request: Request, request_files: list[UploadFile] = File(..., a
     return UploadResponse(pages=pages, errors=errors)
 
 
-def _extract_fields(image_bytes: bytes) -> dict:
-    words_data = get_word_coordinates(image_bytes)
-    cropped_images = extract_field_images(image_bytes, words_data)
-    return extract_fields_with_gemini(cropped_images)
+# def _extract_fields(image_bytes: bytes) -> dict:
+#     words_data = get_word_coordinates(image_bytes)
+#     cropped_images = extract_field_images(image_bytes, words_data)
+#     return extract_fields_with_gemini(cropped_images)
 
 
 @app.post("/extract/{file_id}/{page_number}")
@@ -73,9 +76,17 @@ async def extract(file_id: str, page_number: int):
     if not image_path.is_file():
         raise HTTPException(status_code=404, detail="page not found")
     image_bytes = image_path.read_bytes()
-    # Vision, OpenCV and Gemini calls all block, so the whole sequence runs off the event loop.
-    final_results = await run_in_threadpool(_extract_fields, image_bytes)
-    return final_results
+    # # Vision, OpenCV and Gemini calls all block, so the whole sequence runs off the event loop.
+    # final_results = await run_in_threadpool(_extract_fields, image_bytes)
+    # return final_results
+    # The full page goes straight to Claude - no OCR or cropping. The call blocks, so run it off
+    # the event loop. {"text": ...} is the shape the frontend reads (lib/api.ts).
+    # text = await run_in_threadpool(extract_full_image_with_claude, image_bytes)
+    # return {"text": text}
+    # Claude may zoom in with crop_image over several turns before it answers.
+    result = await run_in_threadpool(extract_with_agent_loop, image_bytes)
+    # The frontend shows "text" as a string, so the fields go back as readable JSON text.
+    return {"text": json.dumps(result, ensure_ascii=False, indent=2)}
 
 
 @app.get("/health")
