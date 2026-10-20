@@ -17,7 +17,8 @@ from .services.ai_service import extract_with_agent_loop
 # from .services.ocr_service import get_word_coordinates
 from .services.processor import UPLOADS_DIR, PageInfo, _process
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+# .env lives in the project root (CLAUDE.md section 8), one level above backend/.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 # A file id is uuid4().hex (see processor._process). It becomes part of a file path, so it must
 # be exactly that and nothing else.

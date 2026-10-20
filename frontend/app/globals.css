@@ -14,6 +14,21 @@ body { margin: 0; font-family: Arial, "Segoe UI", sans-serif; background: #f5f6f
 .extract-btn:hover:not(:disabled) { background: #1d4fd8; }
 .extract-btn:disabled { background: #8a97a6; cursor: progress; }
 .extract-text { max-height: 240px; overflow: auto; padding: 8px; background: #f5f6f8; border: 1px solid #e4e7eb; border-radius: 6px; font-size: 13px; text-align: start; white-space: pre-wrap; overflow-wrap: anywhere; }
+.fields { display: flex; flex-direction: column; gap: 2px; font-size: 13px; text-align: start; }
+.field { display: flex; gap: 6px; align-items: baseline; padding: 2px 4px; border-radius: 4px; }
+.field-label { flex: 0 0 auto; color: #52606d; }
+.field-value { flex: 1 1 auto; overflow-wrap: anywhere; }
+/* Read, but not with certainty (50% and up is still filled in) - orange until a human checks it. */
+.field.flagged { background: #fdf0e3; }
+.field.flagged .field-label, .field.flagged .field-value { color: #b2560d; font-weight: 600; }
+/* Scored below the threshold: nothing was actually read there, so this one is red. */
+.field.flagged.unread { background: #fdeceb; }
+.field.flagged.unread .field-label, .field.flagged.unread .field-value { color: #c0170c; }
+.field-null { font-family: ui-monospace, "Consolas", monospace; opacity: 0.8; }
+.field-score { flex: 0 0 auto; color: #b2560d; font-size: 11px; }
+.field.unread .field-score { color: #c0170c; }
+.fields details { margin-top: 4px; font-size: 12px; }
+.fields summary { cursor: pointer; color: #52606d; }
 .extract-error { margin: 0; font-size: 13px; text-align: start; overflow-wrap: anywhere; }
 .overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.7); display: flex; justify-content: center; align-items: flex-start; overflow: auto; padding: 24px; z-index: 10; }
 .viewer { background: #fff; border-radius: 8px; padding: 12px; max-width: 1000px; width: 100%; }
