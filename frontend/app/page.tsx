@@ -66,6 +66,7 @@ export default function Home() {
             rows={batch.rows}
             conflicts={batch.conflicts}
             onEdit={batch.editCell}
+            onEditCommitment={batch.editCommitment}
             onRetry={batch.retry}
             onRemove={batch.removeRow}
             onView={(row) => setViewing(row.page)}

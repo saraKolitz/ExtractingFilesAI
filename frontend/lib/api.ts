@@ -1,4 +1,8 @@
-export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// The backend serves everything under /api. Locally it runs on its own port, so that is the
+// default. On Vercel the browser reaches it on the same domain through the /api rewrite in
+// vercel.json, so the frontend service is built with NEXT_PUBLIC_API_URL=/api (see its
+// buildCommand there). Under `vercel dev` put NEXT_PUBLIC_API_URL=/api in frontend/.env.local.
+export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api";
 
 export interface PageInfo {
   file_id: string;

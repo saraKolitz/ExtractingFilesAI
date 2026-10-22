@@ -296,3 +296,59 @@ def test_the_model_cannot_override_the_classified_sender(monkeypatch):
     )
     monkeypatch.setattr(ai, "client", fake)
     assert ai.extract_with_agent_loop(b"png")["sending_entity"] == ENTITY
+
+
+# --- the JSON in the model's final reply ------------------------------------------------------
+
+OBJECT = {"first_name": "דנה", "central_numbers": ["948205"]}
+
+
+@pytest.mark.parametrize("text", [
+    json.dumps(OBJECT, ensure_ascii=False),
+    "```json\n" + json.dumps(OBJECT, ensure_ascii=False) + "\n```",
+    "Here is the JSON you asked for:\n```json\n" + json.dumps(OBJECT, ensure_ascii=False, indent=2) + "\n```\nLet me know if you need more.",
+    "All fields were found. " + json.dumps(OBJECT, ensure_ascii=False) + " Done.",
+    "\n\n  " + json.dumps(OBJECT, ensure_ascii=False) + "  \n",
+])
+def test_the_object_is_found_whatever_is_written_around_it(text):
+    assert ai._parse_json_reply(text) == OBJECT
+
+
+@pytest.mark.parametrize("text", ["", "no json here", "[1, 2, 3]", '"just a string"', "{broken", "} before {", "```\n```"])
+def test_a_reply_without_a_json_object_is_a_value_error(text):
+    with pytest.raises(ValueError):
+        ai._parse_json_reply(text)
+
+
+# --- where the central number and the commitment number sit -----------------------------------
+
+
+@pytest.mark.parametrize("entity", [None, ENTITY])
+def test_the_central_label_is_described_as_vertical_to_the_right_of_the_barcode(entity):
+    prompt = flat(ai.build_extraction_prompt(entity))
+    assert "WHERE IT USUALLY IS" in prompt
+    assert 'to the RIGHT of the barcode the word "מרכזי" printed vertically (rotated 90 degrees)' in prompt
+    assert "the number printed beneath the barcode" in prompt
+    assert "often at the top of the page" in prompt
+    # An empty answer is only allowed after looking around every barcode - not straight away.
+    assert "do NOT answer null / [] for central_numbers just because you did not spot the label" in prompt
+    assert "turn the crop sideways" in prompt
+
+
+@pytest.mark.parametrize("entity", [None, ENTITY])
+def test_a_commitment_number_with_no_label_is_a_6_to_8_digit_number_beside_a_barcode(entity):
+    prompt = flat(ai.build_extraction_prompt(entity))
+    assert "OFTEN NO LABEL AT ALL" in prompt
+    assert "a number of 6 to 8 digits printed next to a barcode" in prompt
+    assert "do not skip it because no label names it" in prompt
+    # The barcode that carries the central label is told apart from the commitment's one,
+    # and a patient-box number is never mistaken for it.
+    assert 'the one that carries the word "מרכזי" is the central number' in prompt
+    assert 'next to "ת.ז." is the ID number, whatever its length' in prompt
+
+
+def test_the_commitment_rule_still_defers_to_the_notes_of_a_sender(monkeypatch):
+    with_notes(monkeypatch, NOTES)
+    prompt = flat(ai.build_extraction_prompt(ENTITY))
+    assert prompt.index("OFTEN NO LABEL AT ALL") < prompt.index(NOTES)
+    assert "take precedence over the default rules above" in prompt

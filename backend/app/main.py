@@ -8,7 +8,7 @@ from pathlib import Path
 
 import msoffcrypto
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -49,8 +49,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Everything this app serves lives under /api. On Vercel the frontend and this backend share one
+# domain: /api/* is routed here and the service receives the path unchanged (/api/upload, not
+# /upload), so the routes carry the prefix themselves. Locally the frontend calls
+# http://localhost:8000/api (see frontend/lib/api.ts).
+API_PREFIX = "/api"
+router = APIRouter(prefix=API_PREFIX)
 # Layout: uploads/<file_id>/original.<ext>, uploads/<file_id>/pages/page_<n>.png, thumb_<n>.jpg
-app.mount("/files", StaticFiles(directory=UPLOADS_DIR), name="files")
+app.mount(f"{API_PREFIX}/files", StaticFiles(directory=UPLOADS_DIR), name="files")
+
+
+def _public_origin(request: Request) -> str:
+    """The scheme and host the browser used, e.g. https://forms.example.com.
+
+    Behind a proxy (Vercel included) the app sees its own plain-http, internal address; the original
+    one arrives in the X-Forwarded-* headers. The page-image links handed to the browser (and put in
+    the Excel file) have to use it, or an https page would be given http image URLs and block them.
+    """
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    if proto not in ("http", "https"):
+        proto = request.url.scheme
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc).split(",")[0].strip()
+    return f"{proto}://{host}"
 
 
 class UploadError(BaseModel):
@@ -63,9 +83,10 @@ class UploadResponse(BaseModel):
     errors: list[UploadError]
 
 
-@app.post("/upload", response_model=UploadResponse)
+@router.post("/upload", response_model=UploadResponse)
 async def upload(request: Request, request_files: list[UploadFile] = File(..., alias="files")):
-    base_url = str(request.base_url).rstrip("/")
+    # _process appends /files/<id>/pages/... to this, which is where the static mount above serves them.
+    base_url = f"{_public_origin(request)}{API_PREFIX}"
     if not request_files:
         raise HTTPException(status_code=400, detail="no files")
     pages: list[PageInfo] = []
@@ -84,7 +105,7 @@ async def upload(request: Request, request_files: list[UploadFile] = File(..., a
 #     return extract_fields_with_gemini(cropped_images)
 
 
-@app.post("/extract/{file_id}/{page_number}")
+@router.post("/extract/{file_id}/{page_number}")
 async def extract(file_id: str, page_number: int):
     if not FILE_ID_RE.fullmatch(file_id):
         raise HTTPException(status_code=400, detail="invalid file id")
@@ -95,12 +116,19 @@ async def extract(file_id: str, page_number: int):
     # # Vision, OpenCV and Gemini calls all block, so the whole sequence runs off the event loop.
     # final_results = await run_in_threadpool(_extract_fields, image_bytes)
     # return final_results
-    # The full page goes straight to Claude - no OCR or cropping. The call blocks, so run it off
+    # The full page goes straight to the model - no OCR or cropping. The call blocks, so run it off
     # the event loop. {"text": ...} is the shape the frontend reads (lib/api.ts).
     # text = await run_in_threadpool(extract_full_image_with_claude, image_bytes)
     # return {"text": text}
-    # Claude may zoom in with crop_image over several turns before it answers.
-    result = await run_in_threadpool(extract_with_agent_loop, image_bytes)
+    # The model may zoom in with crop_image over several turns before it answers.
+    try:
+        result = await run_in_threadpool(extract_with_agent_loop, image_bytes)
+    except RuntimeError as exc:
+        # The model declined, was cut off, or Gemini's quota is used up. These messages are ours
+        # (see ai_service) and say what to change - nothing from the page - so they go to the table.
+        raise HTTPException(status_code=502, detail=str(exc)[:MAX_ERROR_DETAIL]) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="The model's reply was not valid JSON - try again") from exc
     # The frontend shows "text" as a string, so the fields go back as readable JSON text.
     return {"text": json.dumps(result, ensure_ascii=False, indent=2)}
 
@@ -204,7 +232,7 @@ def _encrypt_workbook(content: bytes, password: str) -> bytes:
     return out.getvalue()
 
 
-@app.post("/export")
+@router.post("/export")
 async def export(body: ExportRequest):
     # The screen already refuses these; this is the same rule for a client that skips the screen.
     bad = [i for i, row in enumerate(body.rows, start=1) if id_blocks_saving(row.values.get("id_number", ""))]
@@ -231,7 +259,7 @@ def require_api_key(x_api_key: str = Header(default="")):
         raise HTTPException(status_code=403, detail="forbidden")
 
 
-@app.get("/records", dependencies=[Depends(require_api_key)])
+@router.get("/records", dependencies=[Depends(require_api_key)])
 async def get_records():
     return {"records": await run_in_threadpool(load_rows, DB_FILE)}
 
@@ -261,17 +289,21 @@ class CalibrationRun(BaseModel):
     suggestion: dict[str, str | int | float | None] = Field(default_factory=dict, max_length=12)
 
 
-@app.post("/calibration/runs")
+@router.post("/calibration/runs")
 async def save_calibration_run(run: CalibrationRun):
     runs = await run_in_threadpool(save_run, CALIBRATION_FILE, run.model_dump())
     return {"runs": runs}
 
 
-@app.get("/calibration/runs")
+@router.get("/calibration/runs")
 async def get_calibration_runs():
     return {"runs": await run_in_threadpool(load_runs, CALIBRATION_FILE)}
 
 
-@app.get("/health")
+@router.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# After every route above is declared: include_router copies the routes in at that moment.
+app.include_router(router)

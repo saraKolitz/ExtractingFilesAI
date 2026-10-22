@@ -16,7 +16,12 @@ load_dotenv(ROOT / ".env")
 # Logs must never contain personal data (file names, content) - only ids and counts.
 logger = logging.getLogger("uvicorn.error")
 
-UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", ROOT / "uploads"))
+# On Vercel the project's files are read-only and only /tmp can be written to - and that is private
+# to one function instance and short-lived, so it is not a place to keep uploads between requests
+# (see the deployment notes). "or" and not a getenv default: an empty UPLOADS_DIR= line in .env
+# must fall back too, or it would become Path("") - the current directory.
+_DEFAULT_UPLOADS_DIR = Path("/tmp/uploads") if os.getenv("VERCEL") else ROOT / "uploads"
+UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR") or _DEFAULT_UPLOADS_DIR)
 RENDER_DPI = 200
 THUMB_WIDTH = 360
 PDF_EXTS = {".pdf"}

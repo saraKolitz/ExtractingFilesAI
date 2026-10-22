@@ -238,7 +238,13 @@ Your task is to extract specific data fields from the provided image and return 
   each one with a margin on all four sides and read the crop turned to every orientation. Whenever
   "מרכזי" appears near a barcode or such a number, in any orientation, the number belongs in this
   array - extract it. This is about reading a label that is there, not about accepting a number
-  that has none. NOT ALWAYS A BARCODE: it is usually a sticker with a barcode, but on handwritten or
+  that has none. WHERE IT USUALLY IS: a sticker with a barcode, the number printed beneath the
+  barcode, and to the RIGHT of the barcode the word "מרכזי" printed vertically (rotated 90
+  degrees). The sticker is often at the top of the page but can be elsewhere. The label is almost
+  always there even when it is hard to see, so do NOT answer null / [] for central_numbers just
+  because you did not spot the label in the full view: first crop the right side and the
+  surroundings of each barcode and read the crop turned sideways. Answer null / [] only after doing
+  that and finding no barcode with a "מרכזי" label anywhere on the page. NOT ALWAYS A BARCODE: it is usually a sticker with a barcode, but on handwritten or
   screen-capture style pages it can be a handwritten number with no barcode at all - do not skip it
   just because there is no barcode. FULL PAGE SCAN: do not stop after finding the first one - scan
   the entire page for every instance labeled "מרכזי", and return ALL of them in this array (there
@@ -249,6 +255,14 @@ Your task is to extract specific data fields from the provided image and return 
   labeled "דרישה" (request) or "דגימה" (sample number); on some forms the sample number is
   explicitly stated to double as the commitment number. Treat these labels as equally valid sources
   for this field, not just for one specific entity.
+  OFTEN NO LABEL AT ALL: on many forms the words "מספר התחייבות" (or "דרישה" / "דגימה") do not
+  appear anywhere near the number. Then the commitment number is simply a number of 6 to 8
+  digits printed next to a barcode - the barcode sticker of the issuing facility - and that is
+  enough: do not skip it because no label names it, and do not wait for one. If the form has
+  several barcode stickers, the one that carries the word "מרכזי" is the central number and
+  belongs to central_numbers, not here; the 6-8 digit number of another barcode, without that
+  label, is the commitment number. A number in the patient-details box next to "ת.ז." is the ID
+  number, whatever its length, and is never a commitment number.
   DEFAULT RULE (it applies unless the notes for this sender, if any appear below, say otherwise):
   the commitment number is the form's own primary identifying number - the unique document number
   or the barcode sticker put on it by the issuing facility. It is NEVER a "מרכזי" number, the
@@ -297,8 +311,9 @@ not.
 
 **Required process:**
 1. Scan the full page and find where each field is, or where it is likely to be: the patient
-   name and ID area, every "מרכזי" sticker, the "התקבל" stamp, and the commitment / דרישה / דגימה
-   number.
+   name and ID area, every barcode sticker (the central one, with its "מרכזי" label beside it, and
+   the commitment number's, often with no label at all), the "התקבל" stamp, and the commitment /
+   דרישה / דגימה number.
 2. Crop before you conclude. You may NOT return null or [] for a field unless you have cropped
    the region where it should be (with that key in `fields`) and still found nothing there. If you
    don't know where a field is, crop the likely areas (stickers, stamps, handwritten areas) to
@@ -306,8 +321,9 @@ not.
 3. Crop handwritten values, ID numbers, and numbers on stickers and stamps even if they look
    readable in the full view, and check them digit by digit in the zoomed view. For every barcode
    and every 6-digit sticker number, leave a margin around it in the crop and look at all four
-   sides for a "מרכזי" label - it is often small and rotated, and the number is a central number
-   only if you find it.
+   sides for a "מרכזי" label - it is usually on the RIGHT of the barcode, small and printed
+   vertically, so turn the crop sideways to read it - and the number is a central number only if
+   you find it. Do not give up on central_numbers after one look at the full page.
 4. Request several crops in the same turn when you can, each one aimed at a different spot on
    the page. If a crop is still unclear, crop again tighter or at a higher scale. Do not stop
    after one look.
@@ -581,12 +597,26 @@ def _uncropped_empty_fields(result: dict, cropped_fields: set[str]) -> list[str]
 
 
 def _parse_json_reply(text: str) -> dict:
-    """Parse the model's final JSON, tolerating a ```json fence around it."""
+    """Parse the model's final JSON object, tolerating a ```json fence and text around it.
+
+    If the whole text is not JSON - the model opened with a sentence or closed with a remark - the
+    object itself is cut out, from the first "{" to the last "}". Raises ValueError if there is no
+    JSON object in it.
+    """
     text = text.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else ""
         text = text.rsplit("```", 1)[0]
-    return json.loads(text)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        data = json.loads(text[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("the reply is not a JSON object")
+    return data
 
 
 def _model_name() -> str:

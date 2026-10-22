@@ -3,6 +3,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { exportExcel, extractPage, saveCalibrationRun, uploadFiles, type PageInfo, type UploadError } from "@/lib/api";
 import { calibrate, fieldOutcome } from "@/lib/calibration";
+import { commitmentLines, removeCommitment, replaceCommitment, splitCommitments } from "@/lib/commitments";
 import { findConflicts, type RowConflicts } from "@/lib/crossCheck";
 import { cellId, pickSpotChecks } from "@/lib/spotCheck";
 import { FIELDS, emptyValues, idLengthError, parseExtraction, type BarcodeSuggestion, type Box, type CellState, type FieldKey, type FieldValues } from "@/lib/fields";
@@ -81,6 +82,57 @@ function auditStatus(row: Row, key: FieldKey): string {
 }
 
 export const cellState = (row: Row, key: FieldKey): CellState => (row.edited[key] ? "ok" : row.states[key]);
+
+/** The rows after line `index` of row `key` is removed. A finished form with several commitment
+ * numbers only loses that number (an edit, so its flag clears); otherwise the form goes. */
+export function withoutLine(rows: Row[], key: string, index: number): Row[] {
+  const row = rows.find((r) => r.key === key);
+  if (!row) return rows;
+  if (row.status === "done" && splitCommitments(row.values.commitment_numbers).length > 1) {
+    return rows.map((r) =>
+      r.key === key
+        ? {
+            ...r,
+            values: { ...r.values, commitment_numbers: removeCommitment(r.values.commitment_numbers, index) },
+            edited: { ...r.edited, commitment_numbers: true },
+          }
+        : r,
+    );
+  }
+  return rows.filter((r) => r.key !== key);
+}
+
+/** What goes into the Excel file: a line per commitment number of every finished form, with the
+ * form's other details copied onto each line. `number` is the line's number in the table (which
+ * counts every line, a form that is not finished included), and every line carries the form's audit
+ * trail - for the commitment field, the final value is that line's own number. */
+export function exportLines(rows: Row[]) {
+  const lines = [];
+  let number = 0;
+  for (const r of rows) {
+    if (r.status !== "done") {
+      number += 1; // shown as one line in the table, not exported
+      continue;
+    }
+    for (const commitment of commitmentLines(r.values.commitment_numbers)) {
+      number += 1;
+      lines.push({
+        values: { ...r.values, commitment_numbers: commitment },
+        link: r.page.image_url,
+        number,
+        source: `${r.page.file_name} · עמוד ${r.page.page_number}`,
+        audit: FIELDS.map((f) => ({
+          field: f.label,
+          original: r.original[f.key],
+          final: f.key === "commitment_numbers" ? commitment : r.values[f.key],
+          confidence: r.confidence[f.key] ?? null,
+          status: auditStatus(r, f.key),
+        })),
+      });
+    }
+  }
+  return lines;
+}
 
 export function useBatch() {
   const [rows, setRows] = useState<Row[]>([]);
@@ -190,15 +242,30 @@ export function useBatch() {
     [patchRow],
   );
 
+  /** A commitment cell was edited: only the number on that line changes, in the page's list. */
+  const editCommitment = useCallback(
+    (key: string, index: number, value: string) => {
+      patchRow(key, (r) => {
+        const next = replaceCommitment(r.values.commitment_numbers, index, value);
+        return next === r.values.commitment_numbers
+          ? r
+          : { ...r, values: { ...r.values, commitment_numbers: next }, edited: { ...r.edited, commitment_numbers: true } };
+      });
+    },
+    [patchRow],
+  );
+
   /** The technician looked at the cell against the page and it is right: clears its flag. */
   const confirmCell = useCallback(
     (key: string, field: FieldKey) => patchRow(key, (r) => ({ ...r, edited: { ...r.edited, [field]: true } })),
     [patchRow],
   );
 
-  const removeRow = useCallback((key: string) => {
+  /** Removes one line of the table. A form with several commitment numbers only loses that number;
+   * the form itself goes when its last line is removed. */
+  const removeRow = useCallback((key: string, index: number) => {
+    setRows((prev) => withoutLine(prev, key, index));
     queue.current = queue.current.filter((p) => pageKey(p) !== key);
-    setRows((prev) => prev.filter((r) => r.key !== key));
   }, []);
 
   // Recomputed from the live values, so fixing a cell clears its own warning.
@@ -277,7 +344,8 @@ export function useBatch() {
     }
   }, [rows]);
 
-  /** Generates the Excel file from the table as it is now, hand edits included. */
+  /** Generates the Excel file from the table as it is now, hand edits included. A form with several
+   * commitment numbers is one line per number, the other details copied onto each. */
   const exportRows = useCallback(async () => {
     setMessage(null);
     // An ID number that is not exactly 9 digits blocks the export until it is fixed or emptied.
@@ -288,23 +356,7 @@ export function useBatch() {
     }
     setExporting(true);
     try {
-      const blob = await exportExcel(
-        rows
-          .filter((r) => r.status === "done")
-          .map((r) => ({
-            values: r.values,
-            link: r.page.image_url,
-            number: rows.indexOf(r) + 1,
-            source: `${r.page.file_name} · עמוד ${r.page.page_number}`,
-            audit: FIELDS.map((f) => ({
-              field: f.label,
-              original: r.original[f.key],
-              final: r.values[f.key],
-              confidence: r.confidence[f.key] ?? null,
-              status: auditStatus(r, f.key),
-            })),
-          })),
-      );
+      const blob = await exportExcel(exportLines(rows));
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -319,5 +371,5 @@ export function useBatch() {
     }
   }, [rows, saveCalibration]);
 
-  return { rows, phase, uploadErrors, message, exporting, stats, addFiles, extractAll, retry, editCell, confirmCell, conflicts, reviewQueue, removeRow, exportRows };
+  return { rows, phase, uploadErrors, message, exporting, stats, addFiles, extractAll, retry, editCell, editCommitment, confirmCell, conflicts, reviewQueue, removeRow, exportRows };
 }

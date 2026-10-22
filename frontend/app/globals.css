@@ -101,6 +101,8 @@ button { font: inherit; cursor: pointer; }
 .data-table tbody tr:nth-child(even) td { background-color: #fafcff; }
 .data-table tbody tr:hover td { background-color: #f1f6ff; }
 .data-table tr:last-child td { border-bottom: 0; }
+/* The 2nd, 3rd... line of a form with several commitment numbers: the rest of the form is a copy. */
+.data-table tr.line-extra td { border-top: 1px dashed #d5deec; }
 .col-num { width: 40px; text-align: center; color: var(--muted); }
 .col-doc { width: 124px; }
 .col-act { width: 44px; text-align: center; }
