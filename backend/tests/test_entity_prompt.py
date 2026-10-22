@@ -102,7 +102,8 @@ def test_commitment_default_rule_excludes_the_other_numbers(entity):
     assert "NEVER" in prompt
     for excluded in ('a "מרכזי" number', "ID number", "case / visit / admission number", "phone number", "a date"):
         assert excluded in prompt
-    assert "do not pick one just because a value is wanted" in prompt
+    assert "write the likeliest candidate" in prompt
+    assert "those exclusions rule out" in prompt
 
 
 def test_the_notes_of_a_sender_take_precedence_over_the_default_rule(monkeypatch):
@@ -147,9 +148,16 @@ def test_name_not_on_the_list_is_cleared():
     assert ai._resolve_classification(reply) == (None, None, None)
 
 
-def test_low_confidence_counts_as_not_identified():
+def test_a_zero_score_counts_as_not_identified():
     reply = {"entity": ENTITY, "evidence": EVIDENCE, "confidence": ai.CONF_EMPTY_BELOW - 1}
     assert ai._resolve_classification(reply) == (None, None, None)
+
+
+@pytest.mark.parametrize("score", [1, 5, 40])
+def test_an_unsure_but_quoted_classification_is_kept(score):
+    # Found-but-unsure is written (and flagged later); the quote check above is what guards it.
+    reply = {"entity": ENTITY, "evidence": EVIDENCE, "confidence": score}
+    assert ai._resolve_classification(reply) == (ENTITY, EVIDENCE, score)
 
 
 def test_missing_confidence_keeps_the_entity_unscored():

@@ -1,7 +1,7 @@
 """Tests for the confidence bands in backend/app/services/ai_service.py (CLAUDE.md section 5).
 
-With the defaults 20 / 70: a score below 20 is dropped, 20 up to and including 70 is kept but
-flagged, and only a score above 70 passes clean. All values below are made up.
+With the defaults 1 / 70: only a score of 0 (a field the model did not find) is dropped, 1 up to
+and including 70 is kept but flagged, and only a score above 70 passes clean. All values below are made up.
 Run from the project root:  backend\\venv\\Scripts\\python.exe -m pytest
 """
 
@@ -31,16 +31,16 @@ def result_with(**scores) -> dict:
 # --- the defaults and how .env overrides them ------------------------------------------------
 
 
-def test_the_defaults_are_20_and_70():
-    assert ai.DEFAULT_CONF_EMPTY_BELOW == 20
+def test_the_defaults_are_1_and_70():
+    assert ai.DEFAULT_CONF_EMPTY_BELOW == 1
     assert ai.DEFAULT_CONF_OK_ABOVE == 70
 
 
 def test_a_missing_or_empty_setting_falls_back_on_the_default(monkeypatch):
     monkeypatch.delenv("CONF_EMPTY_BELOW", raising=False)
-    assert ai._conf_threshold("CONF_EMPTY_BELOW", 20) == 20
+    assert ai._conf_threshold("CONF_EMPTY_BELOW", 1) == 1
     monkeypatch.setenv("CONF_EMPTY_BELOW", "")
-    assert ai._conf_threshold("CONF_EMPTY_BELOW", 20) == 20
+    assert ai._conf_threshold("CONF_EMPTY_BELOW", 1) == 1
 
 
 def test_a_setting_in_env_overrides_the_default(monkeypatch):
@@ -57,8 +57,8 @@ def test_a_bad_setting_is_replaced_or_clamped(monkeypatch, raw, expected):
 # --- the bands -------------------------------------------------------------------------------
 
 
-def test_below_the_lower_threshold_the_value_is_dropped_and_flagged():
-    data = result_with(first_name=19, central_numbers=19)
+def test_a_zero_score_means_not_found_and_the_value_is_dropped():
+    data = result_with(first_name=0, central_numbers=0)
     ai._apply_confidence(data)
     assert data["first_name"] is None
     assert data["central_numbers"] == []
@@ -66,8 +66,8 @@ def test_below_the_lower_threshold_the_value_is_dropped_and_flagged():
     assert {"first_name", "central_numbers"} <= set(data["fields_requiring_review"])
 
 
-@pytest.mark.parametrize("score", [20, 45, 70])
-def test_from_20_up_to_70_the_value_is_kept_and_flagged(score):
+@pytest.mark.parametrize("score", [1, 2, 20, 45, 70])
+def test_from_1_up_to_70_the_value_is_kept_and_flagged(score):
     data = result_with(last_name=score)
     ai._apply_confidence(data)
     assert data["last_name"] == "לוי"
@@ -83,8 +83,8 @@ def test_above_70_the_value_passes_clean(score):
     assert data["fields_requiring_review"] == []
 
 
-def test_the_boundaries_sit_exactly_at_19_20_70_71():
-    data = result_with(first_name=19, last_name=20, id_number=70, received_date=71)
+def test_the_boundaries_sit_exactly_at_0_1_70_71():
+    data = result_with(first_name=0, last_name=1, id_number=70, received_date=71)
     ai._apply_confidence(data)
     assert data["first_name"] is None
     assert data["last_name"] == "לוי"
@@ -96,7 +96,7 @@ def test_the_boundaries_sit_exactly_at_19_20_70_71():
 def test_the_thresholds_are_sent_along_for_the_table():
     data = result_with()
     ai._apply_confidence(data)
-    assert data["thresholds"] == {"empty_below": 20, "ok_above": 70}
+    assert data["thresholds"] == {"empty_below": 1, "ok_above": 70}
 
 
 def test_an_empty_field_is_flagged_with_score_zero():
@@ -149,8 +149,24 @@ def test_the_prompts_carry_the_configured_thresholds():
     for prompt in (ai.PROMPT, ai.ENTITY_CLASSIFICATION_PROMPT):
         assert "<<" not in prompt
     flat = " ".join(ai.PROMPT.split())
-    assert f"{ai.CONF_EMPTY_BELOW} or more: WRITE THE VALUE" in flat
-    assert f"Below {ai.CONF_EMPTY_BELOW}: you did not really read it" in flat
+    assert f"Scores of {ai.CONF_EMPTY_BELOW} and up are all kept" in flat
+    assert f"A score below {ai.CONF_EMPTY_BELOW} makes the code throw the value away" in flat
     assert f"you score {ai.CONF_OK_ABOVE} or below must also be listed" in flat
     assert f"anything from {ai.CONF_EMPTY_BELOW} up is kept" in flat
-    assert re.search(rf"Below {ai.CONF_EMPTY_BELOW} means you did not", " ".join(ai.ENTITY_CLASSIFICATION_PROMPT.split()))
+    classification = " ".join(ai.ENTITY_CLASSIFICATION_PROMPT.split())
+    assert re.search(rf"below {ai.CONF_EMPTY_BELOW} makes the code discard the entity", classification)
+
+
+def test_the_prompts_say_a_found_field_is_always_written_and_only_a_missing_one_is_left_empty():
+    flat = " ".join(ai.PROMPT.split())
+    assert "FOUND the field: ALWAYS WRITE THE VALUE" in flat
+    assert "however unsure you are" in flat
+    assert "Did NOT find the field" in flat and "score it 0" in flat
+    # The guard against invention stays: unsure is allowed, made up is not.
+    assert "never write a value that is not visible on the page" in flat
+    assert "an unsure reading of what is there is fine, a completion of what is not is not" in flat
+    # The old rule - leave it empty when not sure - is gone.
+    assert "you did not really read it" not in flat
+    assert "do not pick one just because" not in flat
+    classification = " ".join(ai.ENTITY_CLASSIFICATION_PROMPT.split())
+    assert "answer with it even when you are not sure" in classification
