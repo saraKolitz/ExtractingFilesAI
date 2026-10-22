@@ -23,7 +23,12 @@ export interface UploadResponse {
 export async function uploadFiles(files: File[]): Promise<UploadResponse> {
   const form = new FormData();
   for (const file of files) form.append("files", file);
-  const res = await fetch(`${API_URL}/upload`, { method: "POST", body: form });
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/upload`, { method: "POST", body: form });
+  } catch {
+    throw new Error("לא ניתן להתחבר לשרת");
+  }
   if (!res.ok) throw new Error(`שגיאת שרת (${res.status})`);
   return (await res.json()) as UploadResponse;
 }
@@ -41,4 +46,25 @@ export async function extractPage(fileId: string, pageNumber: number): Promise<s
     throw new Error(detail ? `החילוץ נכשל: ${detail}` : `שגיאת שרת (${res.status})`);
   }
   return ((await res.json()) as { text: string }).text;
+}
+
+export interface ExportRow {
+  values: Record<string, string>;
+  link: string;
+}
+
+/** Sends the (possibly hand-corrected) rows to the server and returns the generated .xlsx. */
+export async function exportExcel(rows: ExportRow[]): Promise<Blob> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rows }),
+    });
+  } catch {
+    throw new Error("לא ניתן להתחבר לשרת");
+  }
+  if (!res.ok) throw new Error(`הייצוא נכשל (${res.status})`);
+  return res.blob();
 }

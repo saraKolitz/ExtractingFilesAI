@@ -9,3 +9,4 @@ google-cloud-vision
 opencv-python-headless
 numpy
 anthropic
+openpyxl
