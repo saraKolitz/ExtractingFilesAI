@@ -37,10 +37,14 @@ def _conf_threshold(name: str, default: int) -> int:
 # Confidence bands (CLAUDE.md section 5), tunable in .env. A value scored below CONF_EMPTY_BELOW
 # is not kept at all, and the table shows that row in red; from there up to and including
 # CONF_OK_ABOVE it IS written, but flagged, and the table shows it in orange with its score;
-# only a score above CONF_OK_ABOVE passes unflagged. So with the defaults: 0-19 dropped, 20-70
-# kept and flagged, 71-100 kept clean.
+# only a score above CONF_OK_ABOVE passes unflagged. So with the defaults: 0 dropped, 1-70 kept and
+# flagged, 71-100 kept clean.
+# Policy: a field that was FOUND is always written, however unsure the reading - the reviewer can
+# check it, and an empty cell gives them nothing to check. Only a field that was not found stays
+# empty, and the model scores that 0. Hence 1, not a higher bar: raise CONF_EMPTY_BELOW in .env if
+# very doubtful readings should be thrown away instead.
 # Defined before the prompts because the prompts tell the model these same numbers.
-DEFAULT_CONF_EMPTY_BELOW = 20
+DEFAULT_CONF_EMPTY_BELOW = 1
 DEFAULT_CONF_OK_ABOVE = 70
 CONF_EMPTY_BELOW = _conf_threshold("CONF_EMPTY_BELOW", DEFAULT_CONF_EMPTY_BELOW)
 CONF_OK_ABOVE = _conf_threshold("CONF_OK_ABOVE", DEFAULT_CONF_OK_ABOVE)
@@ -175,13 +179,17 @@ Follow these steps, in order:
    authority or foreign payer (e.g. "הרשות הפלסטינאית"), an insurance company, a private clinic or
    an external laboratory. Never substitute a listed HMO because it is the most common one,
    because its name partly resembles what is written, or because a value "has to" be filled in.
-   An empty answer is correct here: a wrong listed name is worse than none, because nothing marks
-   it as invented.
+   If no wording on the page names an institution on the list, the answer is null: a wrong listed
+   name is worse than none, because nothing marks it as invented.
+6. If you CAN quote wording on the page that names an institution on the list, answer with it even
+   when you are not sure - score it honestly, however low. The quote is what keeps the answer
+   honest, so an unsure answer with a quote is better than null.
 
 Respond with ONLY a JSON object - no Markdown, no explanation, nothing else:
 {"entity": <exactly one value copied from the list, or null>, "evidence": <the wording quoted from the page, or null>, "confidence": <0-100>}
-"confidence" is how sure you are that the entity is right. Below <<EMPTY_BELOW>> means you did not
-really identify it: use null for "entity" and "evidence" in that case.
+"confidence" is how sure you are that the entity is right. Use null for both "entity" and
+"evidence" only when you found no wording naming an institution on the list; then score 0. A score
+below <<EMPTY_BELOW>> makes the code discard the entity.
 """
 ENTITY_CLASSIFICATION_PROMPT = _with_thresholds(ENTITY_CLASSIFICATION_PROMPT).replace(
     "<<ENTITY_LIST>>", ", ".join(ENTITY_TEMPLATES.keys())
@@ -195,14 +203,16 @@ _PROMPT_HEAD = """You are an expert AI data extraction system specialized in sca
 Your task is to extract specific data fields from the provided image and return ONLY a valid, structured JSON object. Do not include any Markdown formatting, explanations, or conversational text outside the JSON.
 
 ### EXTRACTION RULES:
-1. STRICT ACCURACY: Do NOT guess or invent information. If a field is not present or cannot be read, return `null` for strings or an empty array `[]` for lists.
+1. STRICT ACCURACY: Do NOT invent information - never write a value that is not visible on the page. If a field is not present, or nothing of it can be made out, return `null` for strings or an empty array `[]` for lists. A value you can make out only partly or doubtfully is NOT "cannot be read": write your best reading of what is visible and score it low (rule 2).
 2. CONFIDENCE: score every field from 0 to 100 in the "confidence" object, under the same JSON
    key - how sure you are that the value you wrote is exactly what is on the page.
-   - <<EMPTY_BELOW>> or more: WRITE THE VALUE, even though you are not fully sure. A reading a
-     human can check is worth more than an empty field, so do not drop a value just because it is
-     imperfect.
-   - Below <<EMPTY_BELOW>>: you did not really read it - leave the field null (or []). A field that
-     is simply not on the page scores 0.
+   - FOUND the field: ALWAYS WRITE THE VALUE - your best reading of what is on the page - however
+     unsure you are, even if you would put the score at only a few percent. A reading a human can
+     check is worth far more than an empty field, so never leave a field empty because you are
+     not sure of it. Scores of <<EMPTY_BELOW>> and up are all kept.
+   - Did NOT find the field (it is not on the page, or you looked where it should be and there is
+     nothing there): leave it null (or []) and score it 0. A score below <<EMPTY_BELOW>> makes the
+     code throw the value away, so never score 0 for something you wrote.
    - Every field you score <<OK_ABOVE>> or below must also be listed in `fields_requiring_review`:
      it is shown to the reviewer, with its score, for checking against the image. Only a score
      above <<OK_ABOVE>> passes without a check, so score honestly: 100 means you are certain,
@@ -242,9 +252,10 @@ Your task is to extract specific data fields from the provided image and return 
   the commitment number is the form's own primary identifying number - the unique document number
   or the barcode sticker put on it by the issuing facility. It is NEVER a "מרכזי" number, the
   patient's ID number, an internal case / visit / admission number (such as "מקרה"), a phone
-  number, or a date. If you cannot tell which number is the commitment number, do not pick one just
-  because a value is wanted: give your best reading a low score in "confidence", or leave the field
-  null / [] with a score below <<EMPTY_BELOW>>.
+  number, or a date. If you cannot tell for sure which number is the commitment number, write the
+  likeliest candidate and give it a low score in "confidence" - but never a number those
+  exclusions rule out. Leave the field null / [] (score 0) only if no number on the page could be
+  the commitment number.
 """
 _PROMPT_HEAD = _with_thresholds(_PROMPT_HEAD)
 
@@ -276,17 +287,19 @@ high-resolution view of part of the form. Coordinates are fractions of the page 
 use scale 3-6. In `fields`, list the JSON keys the crop is meant to read.
 
 **How your answer is judged:** the fewer fields you return as null or [], the better - as long as
-every value was actually read from the image. A null means you failed to read a field, not that
-you played it safe. But a guessed value is worse than a null: never guess, never fill in missing
+every value was actually read from the image. A null means you did not find the field, not that
+you played it safe: when you found it, write it, however unsure you are, and let the score say so.
+But an invented value is worse than a null: never write what you cannot see, never fill in missing
 digits, and never "fix" a name or number to what seems likely. Every value must be something you
-can see in the image.
+can see in the image - an unsure reading of what is there is fine, a completion of what is not is
+not.
 
 **Required process:**
 1. Scan the full page and find where each field is, or where it is likely to be: the patient
    name and ID area, every "מרכזי" sticker, the "התקבל" stamp, and the commitment / דרישה / דגימה
    number.
 2. Crop before you conclude. You may NOT return null or [] for a field unless you have cropped
-   the region where it should be (with that key in `fields`) and still could not read it. If you
+   the region where it should be (with that key in `fields`) and still found nothing there. If you
    don't know where a field is, crop the likely areas (stickers, stamps, handwritten areas) to
    search for it.
 3. Crop handwritten values, ID numbers, and numbers on stickers and stamps even if they look
@@ -302,13 +315,13 @@ can see in the image.
    survey: use it to FIND where a field is, but it does not count as having read anything, and
    you will be sent back to crop that spot on its own. Do not list several fields in `fields`
    unless they are printed together in that same small area.
-5. If you could read a value but are unsure about a character, fill it in, score it honestly in
-   "confidence" (anything from <<EMPTY_BELOW>> up is kept, not dropped) and add its key to
-   `fields_requiring_review` - do not return null for it. Only a value you cannot read at all,
-   after cropping, stays null (or []) with a score below <<EMPTY_BELOW>>, and goes into
-   `fields_requiring_review`.
-6. When every field is either read or cropped and found missing or illegible, output the final
-   JSON object only.
+5. If you found a value but are unsure of it - a character, a whole number, even whether it is the
+   right field - fill it in, score it honestly in "confidence" (anything from <<EMPTY_BELOW>> up
+   is kept, not dropped) and add its key to `fields_requiring_review` - do not return null for
+   it. Only a field you did not find at all, after cropping the places it should be, stays null
+   (or []) with a score of 0, and goes into `fields_requiring_review`.
+6. When every field is either written or cropped and found missing, output the final JSON object
+   only.
 """
 _PROMPT_TAIL = _with_thresholds(_PROMPT_TAIL)
 
@@ -515,8 +528,9 @@ def _apply_confidence(data: dict) -> None:
 
     A field scored CONF_EMPTY_BELOW or more stays filled - that is the point of asking for a score
     rather than a yes/no: a partly-sure reading reaches the reviewer instead of being thrown away.
-    Below CONF_EMPTY_BELOW the value is dropped (it was not really read). Up to and including
-    CONF_OK_ABOVE a field is flagged for review; only a score above it passes clean.
+    Below CONF_EMPTY_BELOW the value is dropped (with the default 1 that is only a score of 0,
+    which the model gives a field it did not find). Up to and including CONF_OK_ABOVE a field is
+    flagged for review; only a score above it passes clean.
 
     fields_requiring_review is rebuilt here from the scores, not taken from the model: the model
     lists what it doubts, and a field it doubted but scored above CONF_OK_ABOVE would otherwise
