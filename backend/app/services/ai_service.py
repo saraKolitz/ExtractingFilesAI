@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 import os
 from anthropic import Anthropic
 
+from .barcode import apply_barcode_check, decode_barcodes
+from .orientation import detect_rotation, rotate_image, tesseract_rotation, unrotate_box
 from .validation import validate_extraction
 
 # .env lives in the project root (CLAUDE.md section 8) - the same file processor.py loads.
@@ -37,14 +39,13 @@ def _conf_threshold(name: str, default: int) -> int:
 # Confidence bands (CLAUDE.md section 5), tunable in .env. A value scored below CONF_EMPTY_BELOW
 # is not kept at all, and the table shows that row in red; from there up to and including
 # CONF_OK_ABOVE it IS written, but flagged, and the table shows it in orange with its score;
-# only a score above CONF_OK_ABOVE passes unflagged. So with the defaults: 0 dropped, 1-70 kept and
-# flagged, 71-100 kept clean.
-# Policy: a field that was FOUND is always written, however unsure the reading - the reviewer can
-# check it, and an empty cell gives them nothing to check. Only a field that was not found stays
-# empty, and the model scores that 0. Hence 1, not a higher bar: raise CONF_EMPTY_BELOW in .env if
-# very doubtful readings should be thrown away instead.
+# only a score above CONF_OK_ABOVE passes unflagged. So with the defaults: 0-14 dropped, 15-70 kept
+# and flagged, 71-100 kept clean.
+# Policy: a reading the model is under 15% sure of is not worth showing - the cell stays empty
+# (NULL on screen) rather than offering the reviewer a near-random value. Anything from 15% up is
+# written and flagged for checking. Change CONF_EMPTY_BELOW in .env to move that bar.
 # Defined before the prompts because the prompts tell the model these same numbers.
-DEFAULT_CONF_EMPTY_BELOW = 1
+DEFAULT_CONF_EMPTY_BELOW = 15
 DEFAULT_CONF_OK_ABOVE = 70
 CONF_EMPTY_BELOW = _conf_threshold("CONF_EMPTY_BELOW", DEFAULT_CONF_EMPTY_BELOW)
 CONF_OK_ABOVE = _conf_threshold("CONF_OK_ABOVE", DEFAULT_CONF_OK_ABOVE)
@@ -469,14 +470,20 @@ MAX_CROP_SIDE = 2000
 MAX_READ_CROP_AREA = 0.06
 
 
-def _crop_area(args: dict) -> float:
-    """The fraction of the page a crop covers, clamped the same way crop_image clamps it."""
+def _crop_box(args: dict) -> list[float] | None:
+    """A crop's [x0, y0, x1, y1] as page fractions, clamped and ordered like crop_image does."""
     try:
         x0, x1 = sorted(min(max(float(args[k]), 0.0), 1.0) for k in ("x0", "x1"))
         y0, y1 = sorted(min(max(float(args[k]), 0.0), 1.0) for k in ("y0", "y1"))
     except (KeyError, TypeError, ValueError):
-        return 1.0
-    return (x1 - x0) * (y1 - y0)
+        return None
+    return [round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4)]
+
+
+def _crop_area(args: dict) -> float:
+    """The fraction of the page a crop covers, clamped the same way crop_image clamps it."""
+    box = _crop_box(args)
+    return 1.0 if box is None else (box[2] - box[0]) * (box[3] - box[1])
 
 
 def crop_image(image_bytes: bytes, x0: float, y0: float, x1: float, y1: float, scale: int = 4) -> bytes:
@@ -528,8 +535,8 @@ def _apply_confidence(data: dict) -> None:
 
     A field scored CONF_EMPTY_BELOW or more stays filled - that is the point of asking for a score
     rather than a yes/no: a partly-sure reading reaches the reviewer instead of being thrown away.
-    Below CONF_EMPTY_BELOW the value is dropped (with the default 1 that is only a score of 0,
-    which the model gives a field it did not find). Up to and including CONF_OK_ABOVE a field is
+    Below CONF_EMPTY_BELOW the value is dropped (with the default 15 that is a score of 0-14,
+    which includes the 0 the model gives a field it did not find). Up to and including CONF_OK_ABOVE a field is
     flagged for review; only a score above it passes clean.
 
     fields_requiring_review is rebuilt here from the scores, not taken from the model: the model
@@ -667,6 +674,25 @@ def _set_sending_entity(result: dict, entity: str | None, evidence: str | None, 
         scores.pop("sending_entity", None)
 
 
+def _page_rotation(image_bytes: bytes) -> int:
+    """How far the page must be turned clockwise to be upright; 0 if unsure, disabled or failing.
+
+    AUTO_ROTATE=0 in .env switches the check off. A failure of this extra step must not cost the
+    extraction, so the page is then simply used as it is.
+    """
+    if (os.getenv("AUTO_ROTATE") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return 0
+    try:
+        # Tesseract first: local and free. The model is only asked when it cannot tell.
+        local = tesseract_rotation(image_bytes)
+        if local is not None:
+            return local
+        return detect_rotation(client, _model_name(), image_bytes)
+    except Exception as exc:
+        logger.warning("orientation check skipped: %s", type(exc).__name__)
+        return 0
+
+
 def extract_with_agent_loop(image_bytes: bytes) -> dict:
     """Identify who sent the form, then extract its fields, zooming in with crop_image as needed.
 
@@ -675,6 +701,13 @@ def extract_with_agent_loop(image_bytes: bytes) -> dict:
     the general prompt alone if it was not identified). Returns the parsed JSON fields. Raises
     RuntimeError if Claude declines, is cut off, or doesn't finish within MAX_AGENT_TURNS.
     """
+    # A sideways scan is turned upright for the model only; the stored page is left as it is, and
+    # the regions recorded below are mapped back onto it.
+    original_bytes = image_bytes
+    rotation = _page_rotation(image_bytes)
+    if rotation:
+        logger.info("page rotated %d degrees clockwise for extraction", rotation)
+        image_bytes = rotate_image(image_bytes, rotation)
     entity, evidence, entity_score = classify_entity(image_bytes)
     # The sender's name, not the page: nothing about the patient reaches the log.
     logger.info("sending entity: %s", entity or "not identified")
@@ -688,7 +721,16 @@ def extract_with_agent_loop(image_bytes: bytes) -> dict:
     }]
     # The sender was settled above, so the loop must not send Claude back to crop for it.
     cropped_fields: set[str] = {"sending_entity"}
+    # Where on the page each field was read, as [x0, y0, x1, y1] page fractions - only from tight
+    # crops, the same ones that count as having read the field. The review mode zooms to these.
+    regions: dict[str, list[list[float]]] = {}
     reminders = 0
+    # Barcodes are read once, from the page itself, as a second source for the central number.
+    try:
+        barcodes = decode_barcodes(original_bytes)
+    except Exception as exc:  # a decoder failure must not cost the whole extraction
+        logger.warning("barcode decoding skipped: %s", type(exc).__name__)
+        barcodes = []
     for _ in range(MAX_AGENT_TURNS):
         response = client.messages.create(
             model=_model_name(),
@@ -722,6 +764,9 @@ def extract_with_agent_loop(image_bytes: bytes) -> dict:
             # Hard validity checks in code (ID, date, sender, number lists): a failing field is
             # flagged and its confidence capped, whatever score the model gave it.
             validate_extraction(result, ok_above=CONF_OK_ABOVE)
+            apply_barcode_check(result, barcodes)
+            result["page_rotation"] = rotation
+            result["regions"] = {f: [unrotate_box(b, rotation) for b in boxes] for f, boxes in regions.items()}
             missing = _uncropped_empty_fields(result, cropped_fields)
             if not missing or reminders >= MAX_CROP_REMINDERS:
                 return result
@@ -770,6 +815,10 @@ def extract_with_agent_loop(image_bytes: bytes) -> dict:
             claimed = [f for f in args.get("fields") or [] if f in CROP_FIELDS]
             if _crop_area(args) <= MAX_READ_CROP_AREA:
                 cropped_fields.update(claimed)
+                box = _crop_box(args)
+                for field in claimed:
+                    if box not in regions.setdefault(field, []):
+                        regions[field].append(box)
             elif claimed:
                 content.append({"type": "text", "text": (
                     f"This crop covers {_crop_area(args):.0%} of the page - too wide to read a "

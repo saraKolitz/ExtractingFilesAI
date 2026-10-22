@@ -267,3 +267,23 @@ class TestFlagsAndConfidence:
         data = run(id_number="1", received_date="99/99/9999", sending_entity="X", central_numbers=["a"])
         assert set(data["validation_errors"]) == {"id_number", "received_date", "sending_entity", "central_numbers"}
         assert all(data["confidence"][f] <= OK_ABOVE for f in data["validation_errors"])
+
+
+# ---------------------------------------------------------------- Saving is blocked for a short ID
+
+class TestIdBlocksSaving:
+    @pytest.mark.parametrize("value", ["11223344", "1", "1234567890", "12345678a", "12-3456782", "١٢٣٤٥٦٧٨٢"])
+    def test_anything_but_nine_digits_blocks(self, value):
+        assert v.id_blocks_saving(value) is True
+
+    @pytest.mark.parametrize("value", [VALID_ID, "000000018", " 123456782 "])
+    def test_nine_digits_do_not_block(self, value):
+        assert v.id_blocks_saving(value) is False
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_an_empty_id_is_allowed(self, value):
+        assert v.id_blocks_saving(value) is False
+
+    def test_a_wrong_check_digit_is_flagged_but_does_not_block(self):
+        assert v.validate_id_number("123456789") == [v.ID_BAD_CHECKSUM]
+        assert v.id_blocks_saving("123456789") is False

@@ -1,8 +1,11 @@
 interface Props {
-  stats: { total: number; done: number; needReview: number; pending: number; awaiting: number; failed: number; secondsSaved: number };
+  stats: { total: number; done: number; needReview: number; pending: number; awaiting: number; conflictRows: number; failed: number; secondsSaved: number };
   exporting: boolean;
   onExport: () => void;
   onExtract: () => void;
+  /** Number of cells waiting for a human look, and the handler that opens the quick review. */
+  reviewCount: number;
+  onReview: () => void;
 }
 
 function formatSaved(seconds: number) {
@@ -11,10 +14,11 @@ function formatSaved(seconds: number) {
   return minutes < 60 ? `${minutes} דק׳` : `${Math.floor(minutes / 60)} שע׳ ${minutes % 60} דק׳`;
 }
 
-export function ExportBar({ stats, exporting, onExport, onExtract }: Props) {
+export function ExportBar({ stats, exporting, onExport, onExtract, reviewCount, onReview }: Props) {
   const metrics = [
     { label: "טפסים שעובדו", value: `${stats.done}/${stats.total}`, tone: "" },
     { label: "דורשים בדיקה", value: String(stats.needReview), tone: stats.needReview ? "warn" : "" },
+    { label: "כפילויות וסתירות", value: String(stats.conflictRows), tone: stats.conflictRows ? "conflict" : "" },
     { label: "זמן שנחסך (הערכה)", value: formatSaved(stats.secondsSaved), tone: "" },
   ];
   return (
@@ -28,6 +32,9 @@ export function ExportBar({ stats, exporting, onExport, onExtract }: Props) {
         ))}
       </div>
       <div className="actions">
+        <button className="review-btn" disabled={reviewCount === 0} onClick={onReview}>
+          {reviewCount > 0 ? `בדיקה מהירה (${reviewCount})` : "בדיקה מהירה"}
+        </button>
         <button className="extract-all-btn" disabled={stats.awaiting === 0} onClick={onExtract}>
           {stats.awaiting > 0 ? `חלץ נתונים מכל הקבצים (${stats.awaiting})` : "חלץ נתונים מכל הקבצים"}
         </button>

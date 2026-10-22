@@ -1,11 +1,13 @@
 "use client";
 
 import { cellState, type Row } from "@/hooks/useBatch";
-import { FIELDS, type FieldKey } from "@/lib/fields";
+import type { RowConflicts } from "@/lib/crossCheck";
+import { FIELDS, FIELD_VALIDATORS, type FieldKey } from "@/lib/fields";
 import { EditableCell } from "./EditableCell";
 
 interface Props {
   rows: Row[];
+  conflicts: Record<string, RowConflicts>;
   onEdit: (rowKey: string, field: FieldKey, value: string) => void;
   onRetry: (rowKey: string) => void;
   onRemove: (rowKey: string) => void;
@@ -33,7 +35,7 @@ function RowStatusCell({ row, onRetry }: { row: Row; onRetry: (key: string) => v
   );
 }
 
-export function DataTable({ rows, onEdit, onRetry, onRemove, onView }: Props) {
+export function DataTable({ rows, conflicts, onEdit, onRetry, onRemove, onView }: Props) {
   return (
     <div className="table-wrap">
       <table className="data-table">
@@ -68,6 +70,9 @@ export function DataTable({ rows, onEdit, onRetry, onRemove, onView }: Props) {
                     value={row.values[f.key]}
                     state={cellState(row, f.key)}
                     score={row.confidence[f.key]}
+                    conflict={conflicts[row.key]?.[f.key]}
+                    verified={row.barcodeConfirmed.includes(f.key)}
+                    validate={FIELD_VALIDATORS[f.key]}
                     onCommit={(v) => onEdit(row.key, f.key, v)}
                   />
                 ))
