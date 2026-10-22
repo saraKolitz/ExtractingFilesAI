@@ -57,6 +57,7 @@ export default function Home() {
           <DataTable
             rows={batch.rows}
             onEdit={batch.editCell}
+            onEditCommitment={batch.editCommitment}
             onRetry={batch.retry}
             onRemove={batch.removeRow}
             onView={(row) => setViewing(row.page)}

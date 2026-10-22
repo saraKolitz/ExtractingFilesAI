@@ -2,6 +2,7 @@
 
 import { useCallback, useMemo, useRef, useState } from "react";
 import { exportExcel, extractPage, uploadFiles, type PageInfo, type UploadError } from "@/lib/api";
+import { commitmentLines, removeCommitment, replaceCommitment, splitCommitments } from "@/lib/commitments";
 import { FIELDS, emptyValues, parseExtraction, type CellState, type FieldKey, type FieldValues } from "@/lib/fields";
 
 // "pending": uploaded, waiting for the user to press extract. "queued": waiting for a free slot.
@@ -39,6 +40,37 @@ const newRow = (page: PageInfo): Row => ({
 });
 
 export const cellState = (row: Row, key: FieldKey): CellState => (row.edited[key] ? "ok" : row.states[key]);
+
+/** The rows after line `index` of row `key` is removed. A finished form with several commitment
+ * numbers only loses that number (an edit, so its flag clears); otherwise the form goes. */
+export function withoutLine(rows: Row[], key: string, index: number): Row[] {
+  const row = rows.find((r) => r.key === key);
+  if (!row) return rows;
+  if (row.status === "done" && splitCommitments(row.values.commitment_numbers).length > 1) {
+    return rows.map((r) =>
+      r.key === key
+        ? {
+            ...r,
+            values: { ...r.values, commitment_numbers: removeCommitment(r.values.commitment_numbers, index) },
+            edited: { ...r.edited, commitment_numbers: true },
+          }
+        : r,
+    );
+  }
+  return rows.filter((r) => r.key !== key);
+}
+
+/** What goes into the Excel file: a line per commitment number of every finished form, with the
+ * form's other details copied onto each line. */
+export const exportLines = (rows: Row[]) =>
+  rows
+    .filter((r) => r.status === "done")
+    .flatMap((r) =>
+      commitmentLines(r.values.commitment_numbers).map((number) => ({
+        values: { ...r.values, commitment_numbers: number },
+        link: r.page.image_url,
+      })),
+    );
 
 export function useBatch() {
   const [rows, setRows] = useState<Row[]>([]);
@@ -146,9 +178,24 @@ export function useBatch() {
     [patchRow],
   );
 
-  const removeRow = useCallback((key: string) => {
+  /** A commitment cell was edited: only the number on that line changes, in the page's list. */
+  const editCommitment = useCallback(
+    (key: string, index: number, value: string) => {
+      patchRow(key, (r) => {
+        const next = replaceCommitment(r.values.commitment_numbers, index, value);
+        return next === r.values.commitment_numbers
+          ? r
+          : { ...r, values: { ...r.values, commitment_numbers: next }, edited: { ...r.edited, commitment_numbers: true } };
+      });
+    },
+    [patchRow],
+  );
+
+  /** Removes one line of the table. A form with several commitment numbers only loses that number;
+   * the form itself goes when its last line is removed. */
+  const removeRow = useCallback((key: string, index: number) => {
+    setRows((prev) => withoutLine(prev, key, index));
     queue.current = queue.current.filter((p) => pageKey(p) !== key);
-    setRows((prev) => prev.filter((r) => r.key !== key));
   }, []);
 
   const stats = useMemo(() => {
@@ -166,16 +213,13 @@ export function useBatch() {
     };
   }, [rows]);
 
-  /** Generates the Excel file from the table as it is now, hand edits included. */
+  /** Generates the Excel file from the table as it is now, hand edits included. A form with several
+   * commitment numbers is one line per number, the other details copied onto each. */
   const exportRows = useCallback(async () => {
     setExporting(true);
     setMessage(null);
     try {
-      const blob = await exportExcel(
-        rows
-          .filter((r) => r.status === "done")
-          .map((r) => ({ values: r.values, link: r.page.image_url })),
-      );
+      const blob = await exportExcel(exportLines(rows));
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -189,5 +233,5 @@ export function useBatch() {
     }
   }, [rows]);
 
-  return { rows, phase, uploadErrors, message, exporting, stats, addFiles, extractAll, retry, editCell, removeRow, exportRows };
+  return { rows, phase, uploadErrors, message, exporting, stats, addFiles, extractAll, retry, editCell, editCommitment, removeRow, exportRows };
 }
