@@ -24,6 +24,34 @@ load_dotenv(ROOT / ".env")
 # Logs must never contain personal data (file names, content) - only error types.
 logger = logging.getLogger("uvicorn.error")
 
+
+def _conf_threshold(name: str, default: int) -> int:
+    """Reads a confidence threshold from .env, falling back on a missing, empty or invalid value."""
+    try:
+        return max(0, min(100, int(os.getenv(name) or default)))
+    except ValueError:
+        logger.error("%s is not a number - using %d", name, default)
+        return default
+
+
+# Confidence bands (CLAUDE.md section 5), tunable in .env. A value scored below CONF_EMPTY_BELOW
+# is not kept at all, and the table shows that row in red; from there up to and including
+# CONF_OK_ABOVE it IS written, but flagged, and the table shows it in orange with its score;
+# only a score above CONF_OK_ABOVE passes unflagged. So with the defaults: 0-19 dropped, 20-70
+# kept and flagged, 71-100 kept clean.
+# Defined before the prompts because the prompts tell the model these same numbers.
+DEFAULT_CONF_EMPTY_BELOW = 20
+DEFAULT_CONF_OK_ABOVE = 70
+CONF_EMPTY_BELOW = _conf_threshold("CONF_EMPTY_BELOW", DEFAULT_CONF_EMPTY_BELOW)
+CONF_OK_ABOVE = _conf_threshold("CONF_OK_ABOVE", DEFAULT_CONF_OK_ABOVE)
+
+
+def _with_thresholds(prompt: str) -> str:
+    """Fills the confidence thresholds into a prompt, so it never states different numbers than
+    the code applies (<<EMPTY_BELOW>> is CONF_EMPTY_BELOW, <<OK_ABOVE>> is CONF_OK_ABOVE)."""
+    return prompt.replace("<<EMPTY_BELOW>>", str(CONF_EMPTY_BELOW)).replace("<<OK_ABOVE>>", str(CONF_OK_ABOVE))
+
+
 # DEFAULT_MODEL = "gemini-1.5-flash"
 # # extract_data_from_image returns its errors as text starting with this prefix.
 # ERROR_PREFIX = "Error: "
@@ -41,9 +69,9 @@ with open(ENTITY_TEMPLATES_PATH, encoding="utf-8") as _f:
 def get_entity_hints(entity_name: str) -> str:
     """Looks up known form-layout hints for one sending entity (hospital or HMO).
 
-    Exposed to Claude as a tool (see ENTITY_HINTS_TOOL): once it has classified the sending
-    entity it asks for that entity's recorded notes - where the commitment number is labeled, or
-    a field this entity's forms never have - before extracting the remaining fields.
+    Used by build_extraction_prompt: once classify_entity has settled the sender, that entity's
+    recorded notes - where the commitment number is labeled, or a field its forms never have -
+    are added to the extraction prompt.
 
     Returns the recorded layout hints for that entity, or an empty string if none are recorded
     or the name isn't recognized.
@@ -118,76 +146,68 @@ def _enforce_closed_list(data: dict) -> bool:
         data["fields_requiring_review"] = [f for f in flags if f != "sending_entity_evidence"]
     return cleared
 
-# Single classification pass, done in one call: try the visual logo/letterhead first (survives
-# noisy OCR and handwriting), and only fall back to the entity's name elsewhere in the page's
-# text if no logo can be matched confidently - both attempts happen inside this one prompt.
-ENTITY_CLASSIFICATION_PROMPT = """Look at this image of a Hebrew medical form, and identify which
-institution (hospital or health fund / קופת חולים) issued it.
+# Classification is its own call, made before the extraction (see classify_entity): try the visual
+# logo/letterhead first (survives noisy OCR and handwriting), and only fall back to the entity's
+# name elsewhere in the page's text if no logo can be matched confidently. The reply carries the
+# wording it was based on, which _enforce_closed_list checks against the entity's known names.
+ENTITY_CLASSIFICATION_PROMPT = """Look at this image of a Hebrew medical form and identify which
+institution (hospital or health fund / קופת חולים) ISSUED / SENT it. This is the only thing you are
+asked to do - do not read or extract anything else from the page.
 
 Closed list of possible values, copied exactly as written: <<ENTITY_LIST>>
 
 Follow these steps, in order:
-1. First, look for a visual logo, letterhead graphic, or stamp at the top of the page. If you can
+1. Look for a visual logo, letterhead graphic, or stamp at the top of the page. If you can
    confidently recognize the issuing institution from it, use that.
-2. If there is no visible logo, or you cannot identify the institution from it alone, then look
-   for the institution's name written anywhere in the text on the page instead (letterhead text,
-   stamps, codes, etc.) and identify it that way.
-3. If you still cannot confidently determine the issuing institution either way, respond with
-   exactly the single word: NONE
+2. If there is no visible logo, or it does not identify the institution, look for the
+   institution's name written anywhere in the text on the page (letterhead text, header, stamps,
+   codes identifying the sender) and identify it that way.
+3. GROUNDING - the answer must rest on the institution's name actually appearing on the page
+   (printed text, stamp, or the wording inside a logo). Copy that wording verbatim into "evidence".
+   Many of these pages are plain internal-system screenshots with no letterhead at all: the type
+   of form, its layout, or the fact that most forms come from some HMO are NOT evidence. If you
+   cannot quote wording that names the institution, you have not identified it.
+4. You are identifying the issuing institution, not the patient's own health fund membership. A
+   field such as "קופת חולים" listed under the PATIENT's personal details (alongside the patient's
+   name, ID number, etc.) describes which HMO the patient belongs to as a person - it is NOT the
+   sender of the form and must be ignored.
+5. The issuer is sometimes a body that is not on the list at all - a government office, an
+   authority or foreign payer (e.g. "הרשות הפלסטינאית"), an insurance company, a private clinic or
+   an external laboratory. Never substitute a listed HMO because it is the most common one,
+   because its name partly resembles what is written, or because a value "has to" be filled in.
+   An empty answer is correct here: a wrong listed name is worse than none, because nothing marks
+   it as invented.
 
-Respond with ONLY the matched entity name (copied exactly from the list), or the word NONE.
-No explanation, no punctuation, nothing else.
+Respond with ONLY a JSON object - no Markdown, no explanation, nothing else:
+{"entity": <exactly one value copied from the list, or null>, "evidence": <the wording quoted from the page, or null>, "confidence": <0-100>}
+"confidence" is how sure you are that the entity is right. Below <<EMPTY_BELOW>> means you did not
+really identify it: use null for "entity" and "evidence" in that case.
 """
-ENTITY_CLASSIFICATION_PROMPT = ENTITY_CLASSIFICATION_PROMPT.replace(
+ENTITY_CLASSIFICATION_PROMPT = _with_thresholds(ENTITY_CLASSIFICATION_PROMPT).replace(
     "<<ENTITY_LIST>>", ", ".join(ENTITY_TEMPLATES.keys())
 )
-PROMPT = """You are an expert AI data extraction system specialized in scanning Hebrew administrative forms.
+
+# The extraction prompt is built per page from three parts (see build_extraction_prompt): this
+# head (rules and fields, the same for every form), a section that depends on who sent the form
+# (_entity_section), and this tail (output format and zoom instructions, also the same for every
+# form). The sender itself is not extracted here - classify_entity settles it first.
+_PROMPT_HEAD = """You are an expert AI data extraction system specialized in scanning Hebrew administrative forms.
 Your task is to extract specific data fields from the provided image and return ONLY a valid, structured JSON object. Do not include any Markdown formatting, explanations, or conversational text outside the JSON.
 
 ### EXTRACTION RULES:
 1. STRICT ACCURACY: Do NOT guess or invent information. If a field is not present or cannot be read, return `null` for strings or an empty array `[]` for lists.
 2. CONFIDENCE: score every field from 0 to 100 in the "confidence" object, under the same JSON
    key - how sure you are that the value you wrote is exactly what is on the page.
-   - 50 or more: WRITE THE VALUE, even though you are not fully sure. A reading a human can check
-     is worth more than an empty field, so do not drop a value just because it is imperfect.
-   - Below 50: you did not really read it - leave the field null (or []). A field that is simply
-     not on the page scores 0.
-   - Every field you did not score 100 must also be listed in `fields_requiring_review`: it is
-     shown to the reviewer in red, with its score, for checking against the image. 100 means you
-     are certain, character for character.
+   - <<EMPTY_BELOW>> or more: WRITE THE VALUE, even though you are not fully sure. A reading a
+     human can check is worth more than an empty field, so do not drop a value just because it is
+     imperfect.
+   - Below <<EMPTY_BELOW>>: you did not really read it - leave the field null (or []). A field that
+     is simply not on the page scores 0.
+   - Every field you score <<OK_ABOVE>> or below must also be listed in `fields_requiring_review`:
+     it is shown to the reviewer, with its score, for checking against the image. Only a score
+     above <<OK_ABOVE>> passes without a check, so score honestly: 100 means you are certain,
+     character for character.
 3. MULTIPLE VALUES: Fields defined as arrays may contain multiple numbers. Extract and save all of them.
-
-### STEP 1 - CLASSIFY THE SENDING ENTITY FIRST:
-Before extracting anything else, identify which institution (hospital or health fund / קופת
-חולים) ISSUED / SENT this form:
-1. First, look for a visual logo, letterhead graphic, or stamp at the top of the page. If you can
-   confidently recognize the issuing institution from it, use that.
-2. Otherwise, look for the institution's name written elsewhere on the page as part of the
-   letterhead, header, stamps, or codes identifying the sender.
-2a. GROUNDING - the classification must rest on the institution's name actually appearing on the
-   page (printed text, stamp, or the wording inside a logo). Copy that wording verbatim into
-   "sending_entity_evidence". Many of these pages are plain internal-system screenshots with no
-   letterhead at all: the type of form, its layout, or the fact that most forms come from some
-   HMO are NOT evidence. If you cannot quote wording that names the institution, you have not
-   identified it - leave sending_entity null and flag it.
-3. IMPORTANT: you are identifying the issuing/sending institution, not the patient's own health
-   fund membership. A field such as "קופת חולים" listed under the PATIENT's personal details
-   (alongside the patient's name, ID number, etc.) describes which HMO the patient belongs to as
-   a person - it is NOT the sender of the form and must be ignored for this purpose.
-4. The issuer is sometimes a body that is not an Israeli HMO or hospital at all - a government
-   office, an authority or foreign payer (e.g. "הרשות הפלסטינאית"), an insurance company, a
-   private clinic or an external laboratory. Such a body is NOT on the closed list, and there is
-   no listed value that stands for it: leave sending_entity null and add it to
-   `fields_requiring_review`. Never substitute a listed HMO because it is the most common one,
-   because its name partly resembles what is written, or because a value "has to" be filled in.
-   For this one field an empty, flagged value is a correct answer and costs you nothing - this
-   overrides the scoring note in the cropping instructions below.
-5. If you still cannot confidently determine the issuing institution, leave sending_entity null
-   and add it to `fields_requiring_review` - do not call the hints tool in that case.
-
-Once you have a confident match, call the `get_entity_hints` tool with that exact entity name to
-retrieve any known layout notes for it, and use what it returns (if anything) while extracting
-the remaining fields below. Call it at most once.
 
 ### FIELDS TO EXTRACT:
 - "first_name" (String): The private name of the patient.
@@ -197,28 +217,38 @@ the remaining fields below. Call it at most once.
   array ONLY if it is explicitly tied to the label "מרכזי" (central) - whether printed on a sticker
   or handwritten next to/under that label. A number on a sticker, or anywhere else on the page,
   that is NOT labeled "מרכזי" must NOT be copied here, no matter how similar it looks to a central
-  number. NOT ALWAYS A BARCODE: it is usually a sticker with a barcode, but on handwritten or
+  number. FORMAT IS ONLY A HINT: a central number usually sits right next to its label and is
+  usually 6 digits (for example 93xxxx or 94xxxx), but the LABEL is what makes a number a central
+  number, never its digits - a 6-digit number in that range with no "מרכזי" label is not one, and
+  a labeled number in another format still is. LOOK FOR THE LABEL CAREFULLY: the word "מרכזי" is
+  small and is very often printed vertically, sideways or rotated (90 degrees in either direction,
+  or tilted) beside the barcode, so in the full view it is easy to mistake for a stray mark or
+  to miss. Check EVERY barcode and every 6-digit number, usually 93xxxx or 94xxxx, for it: crop
+  each one with a margin on all four sides and read the crop turned to every orientation. Whenever
+  "מרכזי" appears near a barcode or such a number, in any orientation, the number belongs in this
+  array - extract it. This is about reading a label that is there, not about accepting a number
+  that has none. NOT ALWAYS A BARCODE: it is usually a sticker with a barcode, but on handwritten or
   screen-capture style pages it can be a handwritten number with no barcode at all - do not skip it
   just because there is no barcode. FULL PAGE SCAN: do not stop after finding the first one - scan
   the entire page for every instance labeled "מרכזי", and return ALL of them in this array (there
   is often more than one for the same sample).
 - "received_date" (String): תאריך קבלת הדגימה. Look for a stamp saying "התקבל" or a handwritten date, often located under the central number.
-- "sending_entity" (String): גורם שולח / קופת חולים / בית חולים, as classified in STEP 1 above.
-  Must be copied exactly as one of the values in this closed list - never guess or invent a value
-  outside it: <<ENTITY_LIST>>. If the form clearly names an entity that is not in this list, leave
-  this field null and add "sending_entity" to `fields_requiring_review` instead of forcing the
-  closest match. An empty flagged field is the CORRECT answer here - a wrong listed name is worse
-  than no name, because a reviewer has no way to tell it was invented.
-- "sending_entity_evidence" (String): the exact wording on the page that names the sending
-  entity, copied character for character as it appears (e.g. a letterhead line, a stamp, or the
-  text inside a logo). Never paraphrase it, never describe the form instead, and never write a
-  name here that is not printed on the page. null if sending_entity is null.
 - "commitment_numbers" (Array of Strings): מספר התחייבות. There may be multiple. The commitment
   number is not always labeled "התחייבות" - depending on the sending institution it may instead be
   labeled "דרישה" (request) or "דגימה" (sample number); on some forms the sample number is
   explicitly stated to double as the commitment number. Treat these labels as equally valid sources
   for this field, not just for one specific entity.
+  DEFAULT RULE (it applies unless the notes for this sender, if any appear below, say otherwise):
+  the commitment number is the form's own primary identifying number - the unique document number
+  or the barcode sticker put on it by the issuing facility. It is NEVER a "מרכזי" number, the
+  patient's ID number, an internal case / visit / admission number (such as "מקרה"), a phone
+  number, or a date. If you cannot tell which number is the commitment number, do not pick one just
+  because a value is wanted: give your best reading a low score in "confidence", or leave the field
+  null / [] with a score below <<EMPTY_BELOW>>.
+"""
+_PROMPT_HEAD = _with_thresholds(_PROMPT_HEAD)
 
+_PROMPT_TAIL = """
 ### JSON OUTPUT FORMAT:
 {
   "first_name": null,
@@ -226,8 +256,6 @@ the remaining fields below. Call it at most once.
   "id_number": null,
   "central_numbers": [],
   "received_date": null,
-  "sending_entity": null,
-  "sending_entity_evidence": null,
   "commitment_numbers": [],
   "confidence": {
     "first_name": 0,
@@ -235,24 +263,11 @@ the remaining fields below. Call it at most once.
     "id_number": 0,
     "central_numbers": 0,
     "received_date": 0,
-    "sending_entity": 0,
     "commitment_numbers": 0
   },
   "fields_requiring_review": []
 }
-"""
-# ENTITY_TEMPLATES is the single source of truth for the closed list of sending entities;
-# the prompt is built from it so the list can't drift out of sync with entity_templates.json.
-PROMPT = PROMPT.replace("<<ENTITY_LIST>>", ", ".join(ENTITY_TEMPLATES.keys()))
-# PROMPT += """
-# ### AGENT LOOP & DYNAMIC CROPPING INSTRUCTIONS:
-# - You have access to a tool named `crop_image(x0, y0, x1, y1, scale)`.
-# - If you scan the full form and notice that certain important fields (such as handwritten names, ID numbers, central numbers, or commitment numbers) are unclear, blurry, or located inside small stamps/stickers, do NOT guess.
-# - Instead, use the `crop_image` tool by providing fractional coordinates (0.0 to 1.0) and an appropriate scale factor (e.g., 4) to get a zoomed-in, high-resolution view of that specific region.
-# - Analyze the cropped image returned by the tool. You may perform multiple crops if necessary across different parts of the form.
-# - Once you have gathered and verified all possible data with high confidence, output the final structured JSON object. If a field remains illegible even after cropping, return `null` (or `[]` for lists) and add its key to `fields_requiring_review`.
-# """
-PROMPT += """
+
 ### AGENT LOOP & DYNAMIC CROPPING INSTRUCTIONS
 These instructions take precedence over EXTRACTION RULES 1-2 above where they differ.
 
@@ -268,14 +283,17 @@ can see in the image.
 
 **Required process:**
 1. Scan the full page and find where each field is, or where it is likely to be: the patient
-   name and ID area, every "מרכזי" sticker, the "התקבל" stamp, the commitment / דרישה / דגימה
-   number, and the sender's logo or letterhead.
+   name and ID area, every "מרכזי" sticker, the "התקבל" stamp, and the commitment / דרישה / דגימה
+   number.
 2. Crop before you conclude. You may NOT return null or [] for a field unless you have cropped
    the region where it should be (with that key in `fields`) and still could not read it. If you
    don't know where a field is, crop the likely areas (stickers, stamps, handwritten areas) to
    search for it.
 3. Crop handwritten values, ID numbers, and numbers on stickers and stamps even if they look
-   readable in the full view, and check them digit by digit in the zoomed view.
+   readable in the full view, and check them digit by digit in the zoomed view. For every barcode
+   and every 6-digit sticker number, leave a margin around it in the crop and look at all four
+   sides for a "מרכזי" label - it is often small and rotated, and the number is a central number
+   only if you find it.
 4. Request several crops in the same turn when you can, each one aimed at a different spot on
    the page. If a crop is still unclear, crop again tighter or at a higher scale. Do not stop
    after one look.
@@ -285,13 +303,58 @@ can see in the image.
    you will be sent back to crop that spot on its own. Do not list several fields in `fields`
    unless they are printed together in that same small area.
 5. If you could read a value but are unsure about a character, fill it in, score it honestly in
-   "confidence" (anything from 50 up is kept, not dropped) and add its key to
+   "confidence" (anything from <<EMPTY_BELOW>> up is kept, not dropped) and add its key to
    `fields_requiring_review` - do not return null for it. Only a value you cannot read at all,
-   after cropping, stays null (or []) with a score below 50, and goes into
+   after cropping, stays null (or []) with a score below <<EMPTY_BELOW>>, and goes into
    `fields_requiring_review`.
 6. When every field is either read or cropped and found missing or illegible, output the final
    JSON object only.
 """
+_PROMPT_TAIL = _with_thresholds(_PROMPT_TAIL)
+
+
+def _entity_section(entity: str | None) -> str:
+    """The part of the extraction prompt that depends on who sent the form.
+
+    The sender was already settled by classify_entity, so the model is told not to extract it. A
+    sender with recorded layout notes (entity_templates.json, "hints") gets them here; a sender
+    without notes, or one that could not be identified, gets only the general instructions.
+    """
+    if entity is None:
+        return (
+            "\n### SENDING ENTITY:\n"
+            "The institution that issued this form could not be identified, so no sender-specific "
+            "notes apply: use only the general instructions in this prompt. Do not return "
+            "sending_entity - it is handled separately.\n"
+        )
+    section = (
+        "\n### SENDING ENTITY (already identified - do not return it):\n"
+        f"A separate step identified the issuer of this form as: {entity}. Do not return "
+        "sending_entity and do not try to re-identify the sender.\n"
+    )
+    hints = get_entity_hints(entity).strip()
+    if hints:
+        section += (
+            f"\n### LAYOUT NOTES FOR FORMS FROM {entity}:\n{hints}\n"
+            "These notes say where to look and how this sender labels things; they are not values. "
+            "For the fields they cover they take precedence over the default rules above. Verify "
+            "everything against the image, and if the form in front of you differs from the notes, "
+            "trust the image.\n"
+        )
+    return section
+
+
+def build_extraction_prompt(entity: str | None) -> str:
+    """The extraction prompt for one form: the general prompt plus its sender's layout notes.
+
+    entity is the canonical name from classify_entity, or None when the sender was not
+    identified. Either way the general instructions are all there; the notes are only added.
+    """
+    return _PROMPT_HEAD + _entity_section(entity) + _PROMPT_TAIL
+
+
+# The general prompt: what a form gets when its sender is unknown or has no notes recorded.
+PROMPT = build_extraction_prompt(None)
 
 # # REST and not the default gRPC: when the connection fails (e.g. a TLS error) gRPC retries for
 # # minutes, so the except below would never get to return the error.
@@ -349,34 +412,15 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
 #     }
 # ]
 
-# The hints lookup as a tool, so the model fetches the layout notes for the entity it actually
-# classified (STEP 1 of the prompt) instead of us pasting all of them into every prompt.
-ENTITY_HINTS_TOOL = {
-    "name": "get_entity_hints",
-    "description": (
-        "Return known form-layout notes for one sending entity (hospital or HMO). Call this once, "
-        "right after identifying sending_entity, passing that same value - before extracting the "
-        "remaining fields. Returns a note that this entity has none on record if nothing is."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "entity_name": {
-                "type": "string",
-                "description": "The sending entity, copied exactly from the closed list.",
-                "enum": list(ENTITY_TEMPLATES.keys()),
-            },
-        },
-        "required": ["entity_name"],
-    },
-}
-
-# The JSON keys the model must fill (fields_requiring_review and sending_entity_evidence are not
-# among them - the evidence only grounds sending_entity, see _enforce_closed_list).
+# The JSON keys of the extracted result (fields_requiring_review and sending_entity_evidence are
+# not among them - the evidence only grounds sending_entity, see _enforce_closed_list).
 DATA_FIELDS = [
     "first_name", "last_name", "id_number", "central_numbers",
     "received_date", "sending_entity", "commitment_numbers",
 ]
+# The ones the extraction call reads off the page. sending_entity is not among them: it is
+# settled before that call by classify_entity, so there is nothing to crop for it.
+CROP_FIELDS = [f for f in DATA_FIELDS if f != "sending_entity"]
 
 # Same tool plus "fields": which keys a crop is for, so the loop can check that every field
 # returned empty was cropped first.
@@ -395,12 +439,11 @@ CLAUDE_TOOLS = [
                 "x1": {"type": "number"},
                 "y1": {"type": "number"},
                 "scale": {"type": "integer"},
-                "fields": {"type": "array", "items": {"type": "string", "enum": DATA_FIELDS}},
+                "fields": {"type": "array", "items": {"type": "string", "enum": CROP_FIELDS}},
             },
             "required": ["x0", "y0", "x1", "y1"],
         },
     },
-    ENTITY_HINTS_TOOL,
 ]
 
 # The API rejects images over 8000 px per side, and bigger images cost more tokens - so the
@@ -460,25 +503,6 @@ MAX_AGENT_TURNS = 12
 MAX_CROP_REMINDERS = 3
 
 
-def _conf_threshold(name: str, default: int) -> int:
-    """Reads a confidence threshold from .env, falling back on a missing, empty or invalid value."""
-    try:
-        return max(0, min(100, int(os.getenv(name) or default)))
-    except ValueError:
-        logger.error("%s is not a number - using %d", name, default)
-        return default
-
-
-# Confidence bands (CLAUDE.md section 5), tunable in .env. A value scored below CONF_EMPTY_BELOW
-# is not kept at all, and the table shows that row in red; from there up to and including
-# CONF_OK_ABOVE it IS written, but flagged, and the table shows it in orange with its score;
-# only a score above CONF_OK_ABOVE passes unflagged.
-# The default 99 means "only a certain reading passes clean"; set CONF_OK_ABOVE=90 in .env for the
-# threshold the specification suggests.
-CONF_EMPTY_BELOW = _conf_threshold("CONF_EMPTY_BELOW", 50)
-CONF_OK_ABOVE = _conf_threshold("CONF_OK_ABOVE", 99)
-
-
 def _score(value) -> int | None:
     """The model's score for one field as an int 0-100, or None if it didn't give a usable one."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -489,16 +513,22 @@ def _score(value) -> int | None:
 def _apply_confidence(data: dict) -> None:
     """Applies the confidence bands to the model's own scores, in place.
 
-    A field scored 50 or more stays filled - that is the point of asking for a score rather than
-    a yes/no: a partly-sure reading reaches the reviewer in red instead of being thrown away.
-    Below CONF_EMPTY_BELOW the value is dropped (it was not really read), and anything that is not
-    a certain reading is flagged either way.
+    A field scored CONF_EMPTY_BELOW or more stays filled - that is the point of asking for a score
+    rather than a yes/no: a partly-sure reading reaches the reviewer instead of being thrown away.
+    Below CONF_EMPTY_BELOW the value is dropped (it was not really read). Up to and including
+    CONF_OK_ABOVE a field is flagged for review; only a score above it passes clean.
+
+    fields_requiring_review is rebuilt here from the scores, not taken from the model: the model
+    lists what it doubts, and a field it doubted but scored above CONF_OK_ABOVE would otherwise
+    stay flagged and the threshold would not mean what it says. The validation rules run after
+    this and add their own flags.
     """
     scores = data.get("confidence")
     if not isinstance(scores, dict):
         # No scores at all: nothing is confirmed, so every filled field goes to the reviewer.
         logger.info("model returned no confidence scores - flagging every filled field")
         scores = {}
+    data["fields_requiring_review"] = []
 
     applied: dict[str, int] = {}
     for field in DATA_FIELDS:
@@ -538,26 +568,116 @@ def _parse_json_reply(text: str) -> dict:
     return json.loads(text)
 
 
-def extract_with_agent_loop(image_bytes: bytes) -> dict:
-    """Send the full page to Claude and let it zoom in with crop_image until it can answer.
+def _model_name() -> str:
+    # "or" and not a getenv default: an empty CLAUDE_MODEL= line in .env must fall back too.
+    return os.getenv("CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL
 
-    Returns the parsed JSON fields. Raises RuntimeError if Claude declines, is cut off, or
-    doesn't finish within MAX_AGENT_TURNS.
+
+def _resolve_classification(reply) -> tuple[str | None, str | None, int | None]:
+    """Turns the model's classification reply into (entity, evidence, confidence).
+
+    The same closed-list rules as before apply, now to the classification alone: the name must be
+    on the list and the wording the model quoted from the page must contain it
+    (_enforce_closed_list), and a reading scored below CONF_EMPTY_BELOW counts as not identified.
+    An entity that does not pass comes back as (None, None, None), and the form is then extracted
+    with the general prompt. The confidence is None when the model gave no usable score.
     """
+    if not isinstance(reply, dict):
+        return None, None, None
+    candidate = {
+        "sending_entity": reply.get("entity"),
+        "sending_entity_evidence": reply.get("evidence"),
+    }
+    _enforce_closed_list(candidate)
+    entity = candidate["sending_entity"]
+    if not isinstance(entity, str) or not entity:
+        return None, None, None
+    score = _score(reply.get("confidence"))
+    if score is not None and score < CONF_EMPTY_BELOW:
+        logger.info("sending_entity dropped: confidence %d is below %d", score, CONF_EMPTY_BELOW)
+        return None, None, None
+    return entity, candidate["sending_entity_evidence"], score
+
+
+def classify_entity(image_bytes: bytes) -> tuple[str | None, str | None, int | None]:
+    """Asks Claude which institution issued the form, before anything else is extracted.
+
+    Returns (entity, evidence, confidence) as _resolve_classification does. The result decides
+    which prompt the extraction gets (see build_extraction_prompt). A reply that is not JSON is
+    treated as "not identified", so the form still goes through with the general prompt; an API
+    failure or a refusal is raised, like in the extraction itself.
+    """
+    image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
+    response = client.messages.create(
+        model=_model_name(),
+        # Thinking tokens count toward max_tokens; the JSON itself is only a few dozen.
+        max_tokens=4000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_data}},
+                {"type": "text", "text": ENTITY_CLASSIFICATION_PROMPT},
+            ],
+        }],
+    )
+    if response.stop_reason == "refusal":
+        raise RuntimeError("Claude declined to process this page")
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("Claude's reply was cut off (max_tokens)")
+    text = "".join(b.text for b in response.content if b.type == "text")
+    try:
+        reply = _parse_json_reply(text)
+    except ValueError:
+        logger.error("entity classification reply was not JSON - using the general prompt")
+        return None, None, None
+    return _resolve_classification(reply)
+
+
+def _set_sending_entity(result: dict, entity: str | None, evidence: str | None, score: int | None) -> None:
+    """Writes the classification into the extraction result, in place.
+
+    The extraction prompt does not ask for the sender, so this is the only place it comes from.
+    The score goes into "confidence" so the bands in _apply_confidence treat it like any field:
+    no sender is scored 0 and flagged, and a missing score leaves the sender flagged too.
+    """
+    result["sending_entity"] = entity
+    result["sending_entity_evidence"] = evidence
+    scores = result.get("confidence")
+    if not isinstance(scores, dict):
+        scores = result["confidence"] = {}
+    if entity is None:
+        scores["sending_entity"] = 0
+    elif score is not None:
+        scores["sending_entity"] = score
+    else:
+        scores.pop("sending_entity", None)
+
+
+def extract_with_agent_loop(image_bytes: bytes) -> dict:
+    """Identify who sent the form, then extract its fields, zooming in with crop_image as needed.
+
+    Two steps: classify_entity settles the sender first, and the page then goes to Claude with
+    the prompt for that sender (the general prompt plus the sender's layout notes, if it has any;
+    the general prompt alone if it was not identified). Returns the parsed JSON fields. Raises
+    RuntimeError if Claude declines, is cut off, or doesn't finish within MAX_AGENT_TURNS.
+    """
+    entity, evidence, entity_score = classify_entity(image_bytes)
+    # The sender's name, not the page: nothing about the patient reaches the log.
+    logger.info("sending entity: %s", entity or "not identified")
     image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
     messages = [{
         "role": "user",
         "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_data}},
-            {"type": "text", "text": PROMPT},
+            {"type": "text", "text": build_extraction_prompt(entity)},
         ],
     }]
-    cropped_fields: set[str] = set()
+    # The sender was settled above, so the loop must not send Claude back to crop for it.
+    cropped_fields: set[str] = {"sending_entity"}
     reminders = 0
     for _ in range(MAX_AGENT_TURNS):
         response = client.messages.create(
-            # "or" and not a getenv default: an empty CLAUDE_MODEL= line in .env must fall back too.
-            model=os.getenv("CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL,
+            model=_model_name(),
             # Thinking tokens count toward max_tokens, so 1500 could cut the reply off mid-JSON.
             max_tokens=16000,
             tools=CLAUDE_TOOLS,
@@ -581,11 +701,9 @@ def extract_with_agent_loop(image_bytes: bytes) -> dict:
             text = "".join(b.text for b in response.content if b.type == "text")
             # return _parse_json_reply(text)
             result = _parse_json_reply(text)
-            # The closed list is enforced here in code, not left to the model.
-            if _enforce_closed_list(result):
-                # We emptied the field on purpose - don't then send Claude back to crop for it.
-                cropped_fields.add("sending_entity")
-            # A field read with 50+ confidence is kept and flagged, not dropped (see the bands).
+            # The sender comes from the classification step, already checked against the closed list.
+            _set_sending_entity(result, entity, evidence, entity_score)
+            # A field scored CONF_EMPTY_BELOW or more is kept and flagged, not dropped (see the bands).
             _apply_confidence(result)
             # Hard validity checks in code (ID, date, sender, number lists): a failing field is
             # flagged and its confidence capped, whatever score the model gave it.
@@ -608,16 +726,6 @@ def extract_with_agent_loop(image_bytes: bytes) -> dict:
         # Every tool_use in this turn needs its tool_result, all in one user message.
         tool_results = []
         for block in tool_uses:
-            if block.name == ENTITY_HINTS_TOOL["name"]:
-                hints = get_entity_hints((block.input or {}).get("entity_name", ""))
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    # An empty string is not valid tool_result content, and silence would read as
-                    # a failed lookup - say plainly that there is nothing on record.
-                    "content": hints or "No layout notes are on record for this entity.",
-                })
-                continue
             if block.name != "crop_image":
                 tool_results.append({
                     "type": "tool_result", "tool_use_id": block.id, "is_error": True,
@@ -645,7 +753,7 @@ def extract_with_agent_loop(image_bytes: bytes) -> dict:
             # at these fields. A wide crop is a survey: it is still returned (finding where a
             # field sits is a legitimate use), but it leaves the field "not looked at", so the
             # reminder below sends Claude back to zoom in on it properly.
-            claimed = [f for f in args.get("fields") or [] if f in DATA_FIELDS]
+            claimed = [f for f in args.get("fields") or [] if f in CROP_FIELDS]
             if _crop_area(args) <= MAX_READ_CROP_AREA:
                 cropped_fields.update(claimed)
             elif claimed:

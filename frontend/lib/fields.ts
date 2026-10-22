@@ -15,7 +15,9 @@ export type FieldValues = Record<FieldKey, string>;
 export const emptyValues = (): FieldValues =>
   Object.fromEntries(FIELDS.map((f) => [f.key, ""])) as FieldValues;
 
-const DEFAULT_EMPTY_BELOW = 50;
+// Only a fallback for a response without "thresholds"; keep it equal to DEFAULT_CONF_EMPTY_BELOW
+// in backend/app/services/ai_service.py.
+const DEFAULT_EMPTY_BELOW = 20;
 
 // "review": read, but has to be checked (orange). "unread": scored under the "empty below"
 // threshold, so nothing was really read (red). "ok": nothing to flag.
