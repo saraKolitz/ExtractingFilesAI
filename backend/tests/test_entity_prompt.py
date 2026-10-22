@@ -153,11 +153,19 @@ def test_a_zero_score_counts_as_not_identified():
     assert ai._resolve_classification(reply) == (None, None, None)
 
 
-@pytest.mark.parametrize("score", [1, 5, 40])
-def test_an_unsure_but_quoted_classification_is_kept(score):
-    # Found-but-unsure is written (and flagged later); the quote check above is what guards it.
+@pytest.mark.parametrize("score", [15, 25, 40])
+def test_an_unsure_but_quoted_classification_is_kept(score, monkeypatch):
+    # Found-but-unsure (at the empty threshold and up) is written and flagged later; the quote check above guards it.
+    monkeypatch.setattr(ai, "CONF_EMPTY_BELOW", ai.DEFAULT_CONF_EMPTY_BELOW)
     reply = {"entity": ENTITY, "evidence": EVIDENCE, "confidence": score}
     assert ai._resolve_classification(reply) == (ENTITY, EVIDENCE, score)
+
+
+@pytest.mark.parametrize("score", [0, 5, 14])
+def test_a_classification_under_the_empty_threshold_is_dropped(score, monkeypatch):
+    monkeypatch.setattr(ai, "CONF_EMPTY_BELOW", ai.DEFAULT_CONF_EMPTY_BELOW)
+    reply = {"entity": ENTITY, "evidence": EVIDENCE, "confidence": score}
+    assert ai._resolve_classification(reply) == (None, None, None)
 
 
 def test_missing_confidence_keeps_the_entity_unscored():

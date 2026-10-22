@@ -1,7 +1,7 @@
 """Tests for the confidence bands in backend/app/services/ai_service.py (CLAUDE.md section 5).
 
-With the defaults 1 / 70: only a score of 0 (a field the model did not find) is dropped, 1 up to
-and including 70 is kept but flagged, and only a score above 70 passes clean. All values below are made up.
+With the defaults 15 / 70: a score under 15 (including the 0 of a field the model did not find)
+is dropped, 15 up to and including 70 is kept but flagged, and only a score above 70 passes clean. All values below are made up.
 Run from the project root:  backend\\venv\\Scripts\\python.exe -m pytest
 """
 
@@ -31,8 +31,8 @@ def result_with(**scores) -> dict:
 # --- the defaults and how .env overrides them ------------------------------------------------
 
 
-def test_the_defaults_are_1_and_70():
-    assert ai.DEFAULT_CONF_EMPTY_BELOW == 1
+def test_the_defaults_are_15_and_70():
+    assert ai.DEFAULT_CONF_EMPTY_BELOW == 15
     assert ai.DEFAULT_CONF_OK_ABOVE == 70
 
 
@@ -57,8 +57,9 @@ def test_a_bad_setting_is_replaced_or_clamped(monkeypatch, raw, expected):
 # --- the bands -------------------------------------------------------------------------------
 
 
-def test_a_zero_score_means_not_found_and_the_value_is_dropped():
-    data = result_with(first_name=0, central_numbers=0)
+@pytest.mark.parametrize("score", [0, 1, 5, 14])
+def test_under_15_percent_the_value_is_dropped_and_the_field_stays_empty(score):
+    data = result_with(first_name=score, central_numbers=score)
     ai._apply_confidence(data)
     assert data["first_name"] is None
     assert data["central_numbers"] == []
@@ -66,8 +67,8 @@ def test_a_zero_score_means_not_found_and_the_value_is_dropped():
     assert {"first_name", "central_numbers"} <= set(data["fields_requiring_review"])
 
 
-@pytest.mark.parametrize("score", [1, 2, 20, 45, 70])
-def test_from_1_up_to_70_the_value_is_kept_and_flagged(score):
+@pytest.mark.parametrize("score", [15, 16, 20, 45, 70])
+def test_from_15_up_to_70_the_value_is_kept_and_flagged(score):
     data = result_with(last_name=score)
     ai._apply_confidence(data)
     assert data["last_name"] == "לוי"
@@ -83,8 +84,8 @@ def test_above_70_the_value_passes_clean(score):
     assert data["fields_requiring_review"] == []
 
 
-def test_the_boundaries_sit_exactly_at_0_1_70_71():
-    data = result_with(first_name=0, last_name=1, id_number=70, received_date=71)
+def test_the_boundaries_sit_exactly_at_14_15_70_71():
+    data = result_with(first_name=14, last_name=15, id_number=70, received_date=71)
     ai._apply_confidence(data)
     assert data["first_name"] is None
     assert data["last_name"] == "לוי"
@@ -96,7 +97,7 @@ def test_the_boundaries_sit_exactly_at_0_1_70_71():
 def test_the_thresholds_are_sent_along_for_the_table():
     data = result_with()
     ai._apply_confidence(data)
-    assert data["thresholds"] == {"empty_below": 1, "ok_above": 70}
+    assert data["thresholds"] == {"empty_below": 15, "ok_above": 70}
 
 
 def test_an_empty_field_is_flagged_with_score_zero():
