@@ -11,6 +11,8 @@ import numpy as np
 # import google.generativeai as genai
 from dotenv import load_dotenv
 # from PIL import Image
+import os
+from anthropic import Anthropic
 
 # .env lives in the project root (CLAUDE.md section 8) - the same file processor.py loads.
 ROOT = Path(__file__).resolve().parents[3]
