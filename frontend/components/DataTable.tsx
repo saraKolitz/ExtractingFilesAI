@@ -2,11 +2,13 @@
 
 import { cellState, type Row } from "@/hooks/useBatch";
 import { commitmentLines } from "@/lib/commitments";
-import { FIELDS, type FieldKey } from "@/lib/fields";
+import type { RowConflicts } from "@/lib/crossCheck";
+import { FIELDS, FIELD_VALIDATORS, type FieldKey } from "@/lib/fields";
 import { EditableCell } from "./EditableCell";
 
 interface Props {
   rows: Row[];
+  conflicts: Record<string, RowConflicts>;
   onEdit: (rowKey: string, field: FieldKey, value: string) => void;
   /** A commitment cell edit: `index` is the line of that form, since each line holds one number. */
   onEditCommitment: (rowKey: string, index: number, value: string) => void;
@@ -51,7 +53,7 @@ function RowStatusCell({ row, onRetry }: { row: Row; onRetry: (key: string) => v
   );
 }
 
-export function DataTable({ rows, onEdit, onEditCommitment, onRetry, onRemove, onView }: Props) {
+export function DataTable({ rows, conflicts, onEdit, onEditCommitment, onRetry, onRemove, onView }: Props) {
   const lines = toLines(rows);
   return (
     <div className="table-wrap">
@@ -87,6 +89,9 @@ export function DataTable({ rows, onEdit, onEditCommitment, onRetry, onRemove, o
                     value={f.key === "commitment_numbers" ? commitment : row.values[f.key]}
                     state={cellState(row, f.key)}
                     score={row.confidence[f.key]}
+                    conflict={conflicts[row.key]?.[f.key]}
+                    verified={row.barcodeConfirmed.includes(f.key)}
+                    validate={FIELD_VALIDATORS[f.key]}
                     onCommit={(v) =>
                       f.key === "commitment_numbers" ? onEditCommitment(row.key, index, v) : onEdit(row.key, f.key, v)
                     }

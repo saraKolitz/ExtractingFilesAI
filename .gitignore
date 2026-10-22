@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 uploads/
+data/
 *credentials*.json
 service-account*.json
 ocr-vision-project.json

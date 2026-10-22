@@ -61,6 +61,16 @@ def validate_id_number(value: str) -> list[str]:
     return [] if total % 10 == 0 else [ID_BAD_CHECKSUM]
 
 
+def id_blocks_saving(value: str) -> bool:
+    """True if a non-empty ID number may not be saved or exported: not exactly 9 digits.
+
+    A wrong check digit is only flagged for review, not blocked - the lab can still have to
+    record an ID that was printed or typed wrongly on the form.
+    """
+    value = value.strip()
+    return bool(value) and bool({ID_NOT_DIGITS, ID_WRONG_LENGTH} & set(validate_id_number(value)))
+
+
 def normalize_date(value: str, today: date | None = None) -> tuple[str | None, list[str]]:
     """Returns (DD/MM/YYYY, errors). The text is read day-first, as on Israeli forms.
 

@@ -71,11 +71,11 @@ A field that is not found stays empty. A guessed value is never filled in.
 
 Confidence is set for each field separately (0 to 100%):
 
-- **Below 50%:** the field stays empty and flagged.
-- **Between 50% and 90%:** the field is filled and highlighted in orange (not sure, please check).
+- **Below 15%:** the field stays empty and flagged.
+- **Between 15% and 90%:** the field is filled and highlighted in orange (not sure, please check).
 - **Above 90%:** the field is filled with no highlighting.
 
-The thresholds are stored in settings (`CONF_EMPTY_BELOW=50`, `CONF_OK_ABOVE=90`) so they can be tuned.
+The thresholds are stored in settings (`CONF_EMPTY_BELOW=15`, `CONF_OK_ABOVE=90`) so they can be tuned.
 A field that fails a hard validity check is flagged in orange even if its score is high.
 
 ## 6. OCR Error Correction

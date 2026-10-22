@@ -2,43 +2,31 @@
 the original path, so the prefix is part of the route), and the page-image links use the public
 origin. No model is called - the extract route is only exercised on requests that fail before it.
 
-Uploads go to a temporary folder, never to the real uploads/. Run from the project root:
+Uploads go to the temporary folder conftest.py sets up, never to the real uploads/. Run from the project root:
 backend\\venv\\Scripts\\python.exe -m pytest
 """
 
 import os
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
 
-# UPLOADS_DIR is read when the processor module is first imported, so it is set before anything
-# imports backend.app.main.
-_UPLOADS = tempfile.mkdtemp(prefix="uploads-test-")
-os.environ["UPLOADS_DIR"] = _UPLOADS
+from backend.app import main
+from backend.app.main import API_PREFIX, app
+from backend.app.services import processor
 
-from fastapi.testclient import TestClient  # noqa: E402
-
-from backend.app.main import API_PREFIX, app  # noqa: E402
-from backend.app.services import processor  # noqa: E402
-
-if Path(processor.UPLOADS_DIR) != Path(_UPLOADS):  # another module imported the processor first
-    pytest.skip("UPLOADS_DIR was already fixed by an earlier import - refusing to write into it", allow_module_level=True)
+# conftest.py points UPLOADS_DIR at a temporary folder before anything is imported; this makes sure
+# no test here can write into the real uploads/ if that ever stops being true.
+assert Path(processor.UPLOADS_DIR) == Path(os.environ["UPLOADS_DIR"]), "uploads are not isolated"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 client = TestClient(app)
-
-
-@pytest.fixture(scope="module", autouse=True)
-def remove_uploads():
-    yield
-    shutil.rmtree(_UPLOADS, ignore_errors=True)
 
 
 def png_bytes() -> bytes:
@@ -63,7 +51,10 @@ def test_health_is_under_api():
     assert response.status_code == 200 and response.json() == {"status": "ok"}
 
 
-@pytest.mark.parametrize("method, path", [("get", "/health"), ("post", "/upload"), ("post", "/export"), ("post", "/extract/" + "a" * 32 + "/1")])
+@pytest.mark.parametrize("method, path", [
+    ("get", "/health"), ("post", "/upload"), ("post", "/export"), ("post", "/extract/" + "a" * 32 + "/1"),
+    ("get", "/records"), ("get", "/calibration/runs"), ("post", "/calibration/runs"),
+])
 def test_the_old_unprefixed_paths_are_gone(method, path):
     assert getattr(client, method)(path).status_code in (404, 405)
 
@@ -77,12 +68,32 @@ def test_a_page_that_was_never_uploaded_is_not_found():
     assert response.status_code == 404 and response.json()["detail"] == "page not found"
 
 
-def test_export_builds_a_workbook():
+def test_export_builds_a_workbook(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_FILE", tmp_path / "t.db")  # an export is also saved to the database
+    monkeypatch.delenv("EXCEL_PASSWORD", raising=False)
     body = {"rows": [{"values": {"first_name": "דנה", "commitment_numbers": "555"}, "link": "https://x.example/api/files/a"}]}
     response = client.post("/api/export", json=body)
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/vnd.openxmlformats")
     assert response.content[:2] == b"PK"  # an .xlsx is a zip
+
+
+def test_records_are_under_api_and_need_the_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_FILE", tmp_path / "t.db")  # reading creates the database file
+    monkeypatch.delenv("DB_API_KEY", raising=False)
+    assert client.get("/api/records").status_code == 403  # no key configured: nobody can read
+    monkeypatch.setenv("DB_API_KEY", "secret")
+    assert client.get("/api/records").status_code == 403
+    assert client.get("/api/records", headers={"x-api-key": "secret"}).status_code == 200
+
+
+def test_calibration_runs_are_saved_and_read_under_api(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "CALIBRATION_FILE", tmp_path / "runs.json")
+    assert client.get("/api/calibration/runs").json() == {"runs": []}
+    run = {"run_id": "abcd-1234", "forms": 2, "reviewed": 5, "correct": 4, "ok_above": 70,
+           "bands": [{"low": 0, "high": 70, "reviewed": 5, "correct": 4}], "fields": [{"field": "id_number", "reviewed": 5, "correct": 4}], "suggestion": {}}
+    assert client.post("/api/calibration/runs", json=run).status_code == 200
+    assert [r["run_id"] for r in client.get("/api/calibration/runs").json()["runs"]] == ["abcd-1234"]
 
 
 # --- the page links ---------------------------------------------------------------------------

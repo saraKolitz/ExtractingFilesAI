@@ -52,9 +52,49 @@ export async function extractPage(fileId: string, pageNumber: number): Promise<s
   return ((await res.json()) as { text: string }).text;
 }
 
+/** One field's journey for the audit sheet: what the model extracted, what was saved, who vouched for it. */
+export interface AuditEntry {
+  field: string;
+  original: string;
+  final: string;
+  confidence: number | null;
+  status: string;
+}
+
 export interface ExportRow {
   values: Record<string, string>;
   link: string;
+  /** The row number as shown in the table. */
+  number: number;
+  source: string;
+  audit: AuditEntry[];
+}
+
+/** The counts of one working session's calibration - no values from any form. */
+export interface CalibrationRunPayload {
+  run_id: string;
+  forms: number;
+  reviewed: number;
+  correct: number;
+  ok_above: number;
+  bands: { low: number; high: number; reviewed: number; correct: number }[];
+  fields: { field: string; reviewed: number; correct: number }[];
+  suggestion: Record<string, string | number>;
+}
+
+/** Saves this run's calibration; the server keeps the last five runs in a file. */
+export async function saveCalibrationRun(run: CalibrationRunPayload): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/calibration/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(run),
+    });
+  } catch {
+    throw new Error("לא ניתן להתחבר לשרת");
+  }
+  if (!res.ok) throw new Error(`שמירת נתוני הכיול נכשלה (${res.status})`);
 }
 
 /** Sends the (possibly hand-corrected) rows to the server and returns the generated .xlsx. */
