@@ -1,12 +1,15 @@
 import json
 import re
+from io import BytesIO
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from openpyxl import Workbook
+from openpyxl.styles import Font
 from pydantic import BaseModel
 
 # from .services.ai_service import ERROR_PREFIX, extract_data_from_image
@@ -88,6 +91,62 @@ async def extract(file_id: str, page_number: int):
     result = await run_in_threadpool(extract_with_agent_loop, image_bytes)
     # The frontend shows "text" as a string, so the fields go back as readable JSON text.
     return {"text": json.dumps(result, ensure_ascii=False, indent=2)}
+
+
+EXPORT_COLUMNS = [
+    ("first_name", "שם פרטי"),
+    ("last_name", "שם משפחה"),
+    ("id_number", "תעודת זהות"),
+    ("central_numbers", "מספר מרכזי"),
+    ("received_date", "תאריך קבלה"),
+    ("sending_entity", "גורם שולח"),
+    ("commitment_numbers", "מספר התחייבות"),
+]
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+class ExportRow(BaseModel):
+    values: dict[str, str]
+    link: str
+
+
+class ExportRequest(BaseModel):
+    rows: list[ExportRow]
+
+
+def _build_workbook(rows: list[ExportRow]) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.sheet_view.rightToLeft = True
+    ws.append([label for _, label in EXPORT_COLUMNS] + ["קישור למסמך"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        ws.append([row.values.get(key, "") for key, _ in EXPORT_COLUMNS] + [""])
+        r = ws.max_row
+        # Every value is text (an ID number must keep its leading zeros), and a string that
+        # starts with "=" must not turn into a formula.
+        for c in ws[r]:
+            c.data_type = "s"
+        link = ws.cell(row=r, column=len(EXPORT_COLUMNS) + 1)
+        link.value = "פתיחת המסמך"
+        link.hyperlink = row.link
+        link.font = Font(color="0563C1", underline="single")
+    for col in ws.columns:
+        ws.column_dimensions[col[0].column_letter].width = 18
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+@app.post("/export")
+async def export(body: ExportRequest):
+    content = await run_in_threadpool(_build_workbook, body.rows)
+    return Response(
+        content=content,
+        media_type=XLSX_MEDIA_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="commitments.xlsx"'},
+    )
 
 
 @app.get("/health")

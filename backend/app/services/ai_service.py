@@ -12,6 +12,8 @@ import numpy as np
 from dotenv import load_dotenv
 # from PIL import Image
 
+from .validation import validate_extraction
+
 # .env lives in the project root (CLAUDE.md section 8) - the same file processor.py loads.
 ROOT = Path(__file__).resolve().parents[3]
 # The API is configured at import time, before main.py's load_dotenv() call can run.
@@ -583,6 +585,9 @@ def extract_with_agent_loop(image_bytes: bytes) -> dict:
                 cropped_fields.add("sending_entity")
             # A field read with 50+ confidence is kept and flagged, not dropped (see the bands).
             _apply_confidence(result)
+            # Hard validity checks in code (ID, date, sender, number lists): a failing field is
+            # flagged and its confidence capped, whatever score the model gave it.
+            validate_extraction(result, ok_above=CONF_OK_ABOVE)
             missing = _uncropped_empty_fields(result, cropped_fields)
             if not missing or reminders >= MAX_CROP_REMINDERS:
                 return result
